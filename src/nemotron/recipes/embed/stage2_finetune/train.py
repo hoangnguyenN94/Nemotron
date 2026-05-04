@@ -143,6 +143,58 @@ def _warn_if_negatives_sparse(train_data_path: Path, train_n_passages: int) -> N
         print()
 
 
+def _build_biencoder_distributed_manager(
+    *,
+    distributed_config,
+    world_size: int,
+    dp_size: int | None = None,
+    dp_replicate_size: int | None = None,
+    tp_size: int = 1,
+    pp_size: int = 1,
+    cp_size: int = 1,
+    ep_size: int = 1,
+):
+    """Build the distributed manager expected by TrainBiencoderRecipe.
+
+    The biencoder recipe currently expects ``cfg.distributed`` to instantiate a
+    manager, while newer AutoModel configs split the strategy into
+    ``distributed_config`` plus size fields under ``distributed``.
+    """
+    from nemo_automodel.components.distributed.config import (
+        DDPConfig,
+        FSDP2Config,
+        MegatronFSDPConfig,
+    )
+    from nemo_automodel.components.distributed.ddp import DDPManager
+    from nemo_automodel.components.distributed.device_mesh import create_device_mesh
+    from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+    from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
+
+    if pp_size > 1:
+        raise NotImplementedError(
+            "Pipeline parallelism is not yet supported for biencoder models. "
+            "Please disable pipeline parallelism in the distributed config."
+        )
+
+    device_mesh, moe_mesh = create_device_mesh(
+        distributed_config,
+        dp_size=dp_size,
+        dp_replicate_size=dp_replicate_size,
+        tp_size=tp_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+        ep_size=ep_size,
+        world_size=world_size,
+    )
+    if isinstance(distributed_config, FSDP2Config):
+        return FSDP2Manager(distributed_config, device_mesh=device_mesh, moe_mesh=moe_mesh)
+    if isinstance(distributed_config, MegatronFSDPConfig):
+        return MegatronFSDPManager(distributed_config, device_mesh=device_mesh)
+    if isinstance(distributed_config, DDPConfig):
+        return DDPManager(distributed_config)
+    raise ValueError(f"Unknown distributed config type: {type(distributed_config)}")
+
+
 def _auto_scale_hyperparams(
     cfg: FinetuneConfig, num_examples: int
 ) -> tuple[int, int, int, int]:
@@ -261,6 +313,9 @@ def run_finetune(cfg: FinetuneConfig) -> Path:
     # Load base config from nemo-automodel defaults
     base_config_path = STAGE_PATH / "biencoder_base.yaml"
     automodel_cfg = load_yaml_config(str(base_config_path))
+    if "distributed_config" in automodel_cfg and "distributed" in automodel_cfg:
+        automodel_cfg.distributed._target_ = _build_biencoder_distributed_manager
+        automodel_cfg.distributed.distributed_config = automodel_cfg.distributed_config
 
     # Apply overrides from our config
     # Model settings

@@ -14,6 +14,8 @@
 # Remote execution (Slurm):
 #   nemotron embed eval -c default --run my-cluster
 #   nemotron embed eval -c default --batch my-cluster
+# If launched with multiple torchrun ranks, only rank 0 performs evaluation
+# and writes eval_results.json; other ranks exit cleanly.
 
 # Execution environment configuration
 run:

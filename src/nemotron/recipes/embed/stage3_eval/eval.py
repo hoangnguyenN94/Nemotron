@@ -276,6 +276,16 @@ class EvalConfig(RecipeSettings):
     nim_timeout: int = Field(default=60, gt=0, description="Timeout in seconds for NIM API requests.")
 
 
+def _get_distributed_rank() -> int:
+    """Return the torchrun rank from environment without requiring torch."""
+    return int(os.environ.get("RANK", "0"))
+
+
+def _get_distributed_world_size() -> int:
+    """Return the torchrun world size from environment without requiring torch."""
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
 def evaluate_model(
     model_path: str | Path,
     dataset_path: Path,
@@ -431,6 +441,12 @@ def run_eval(cfg: EvalConfig) -> dict:
     Returns:
         Dictionary with evaluation results.
     """
+    rank = _get_distributed_rank()
+    world_size = _get_distributed_world_size()
+    if world_size > 1 and rank != 0:
+        print(f"Distributed evaluation launched with world_size={world_size}; rank {rank} is idle.")
+        return {}
+
     # Trust remote code for HuggingFace models (e.g. nvidia/llama-nemotron-embed)
     # to avoid interactive prompts during evaluation.
     os.environ.setdefault("HF_HUB_TRUST_REMOTE_CODE", "1")
