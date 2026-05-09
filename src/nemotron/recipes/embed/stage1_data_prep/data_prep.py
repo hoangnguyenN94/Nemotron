@@ -167,6 +167,11 @@ def run_mining(cfg: DataPrepConfig, train_file: Path) -> Path:
     Returns:
         Path to mined training file.
     """
+    if "Qwen3-Embedding" in _normalize_hf_model_name(cfg.base_model):
+        return _run_qwen_mining(cfg, train_file)
+    if "NV-Embed" in _normalize_hf_model_name(cfg.base_model):
+        return _run_nv_embed_mining(cfg, train_file)
+
     mining_script = STAGE_PATH / "scripts" / "mine_hard_negatives.py"
     mining_config = STAGE_PATH / "scripts" / "mining_config.yaml"
     output_file = cfg.output_dir / "train_mined.automodel.json"
@@ -216,6 +221,276 @@ def run_mining(cfg: DataPrepConfig, train_file: Path) -> Path:
         sys.exit(result.returncode)
 
     return output_file
+
+
+def _run_qwen_mining(cfg: DataPrepConfig, train_file: Path) -> Path:
+    """Mine hard negatives with Qwen embedding models via Transformers.
+
+    NeMo Automodel's biencoder miner cannot infer Qwen3-Embedding classes yet,
+    so this path preserves the same input/output contract with a generic
+    embedding pass.
+    """
+    import numpy as np
+    import pandas as pd
+    import torch
+    import torch.nn.functional as F
+    from transformers import AutoModel, AutoTokenizer
+
+    output_file = cfg.output_dir / "train_mined.automodel.json"
+    model_name = _normalize_hf_model_name(cfg.base_model)
+
+    print(f"\n⛏️  Mining hard negatives...")
+    print(f"   Using Qwen embedding model: {model_name}")
+
+    with open(train_file, "r", encoding="utf-8") as f:
+        train_data = json.load(f)
+
+    records = train_data.get("data", [])
+    corpus_info = train_data.get("corpus", {})
+    corpus_path = Path(corpus_info.get("path", "./corpus/"))
+    if not corpus_path.is_absolute():
+        corpus_path = train_file.parent / corpus_path
+    parquet_path = corpus_path / "train.parquet"
+    if not parquet_path.exists():
+        print(f"Error: corpus parquet not found: {parquet_path}", file=sys.stderr)
+        sys.exit(1)
+
+    corpus_df = pd.read_parquet(parquet_path)
+    doc_ids = corpus_df["id"].astype(str).tolist()
+    doc_texts = corpus_df["text"].astype(str).tolist()
+    doc_id_to_index = {doc_id: idx for idx, doc_id in enumerate(doc_ids)}
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
+    model = AutoModel.from_pretrained(
+        model_name,
+        torch_dtype=dtype,
+        attn_implementation=cfg.attn_implementation,
+    ).to(device)
+    model.eval()
+
+    def last_token_pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        left_padding = attention_mask[:, -1].sum() == attention_mask.shape[0]
+        if left_padding:
+            return last_hidden_states[:, -1]
+        sequence_lengths = attention_mask.sum(dim=1) - 1
+        batch_size = last_hidden_states.shape[0]
+        return last_hidden_states[torch.arange(batch_size, device=last_hidden_states.device), sequence_lengths]
+
+    def encode(texts: list[str], max_length: int, batch_size: int) -> np.ndarray:
+        vectors: list[np.ndarray] = []
+        with torch.no_grad():
+            for start in range(0, len(texts), batch_size):
+                batch = texts[start:start + batch_size]
+                inputs = tokenizer(
+                    batch,
+                    padding=True,
+                    truncation=True,
+                    max_length=max_length,
+                    return_tensors="pt",
+                ).to(device)
+                outputs = model(**inputs)
+                embeddings = last_token_pool(outputs.last_hidden_state, inputs["attention_mask"])
+                embeddings = F.normalize(embeddings, p=2, dim=1)
+                vectors.append(embeddings.float().cpu().numpy())
+        return np.concatenate(vectors, axis=0) if vectors else np.empty((0, 0), dtype=np.float32)
+
+    query_texts = [f"{cfg.query_prefix} {record['question']}".strip() for record in records]
+    passage_texts = [f"{cfg.passage_prefix} {text}".strip() for text in doc_texts]
+
+    query_embeddings = encode(query_texts, cfg.query_max_length, max(1, min(cfg.mining_batch_size, 16)))
+    doc_embeddings = encode(passage_texts, cfg.passage_max_length, max(1, min(cfg.mining_batch_size, 16)))
+    scores = query_embeddings @ doc_embeddings.T
+
+    for row_idx, record in enumerate(records):
+        pos_ids = {str(doc.get("id")) for doc in record.get("pos_doc", [])}
+        pos_indices = [doc_id_to_index[doc_id] for doc_id in pos_ids if doc_id in doc_id_to_index]
+        min_pos_score = float(scores[row_idx, pos_indices].min()) if pos_indices else 1.0
+        cutoff = min_pos_score * cfg.hard_neg_margin
+
+        candidates: list[tuple[float, str]] = []
+        fallback: list[tuple[float, str]] = []
+        for doc_id, doc_idx in doc_id_to_index.items():
+            if doc_id in pos_ids:
+                continue
+            score = float(scores[row_idx, doc_idx])
+            fallback.append((score, doc_id))
+            if score <= cutoff:
+                candidates.append((score, doc_id))
+
+        candidates.sort(reverse=True)
+        fallback.sort(reverse=True)
+        selected = candidates[:cfg.hard_negatives_to_mine]
+        if len(selected) < cfg.hard_negatives_to_mine:
+            selected_ids = {doc_id for _, doc_id in selected}
+            selected.extend(
+                item for item in fallback
+                if item[1] not in selected_ids
+            )
+            selected = selected[:cfg.hard_negatives_to_mine]
+
+        record["neg_doc"] = [{"id": doc_id} for _, doc_id in selected]
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(train_data, f, indent=2)
+
+    print(f"   Wrote mined training data: {output_file}")
+    return output_file
+
+
+def _run_nv_embed_mining(cfg: DataPrepConfig, train_file: Path) -> Path:
+    """Mine hard negatives with NV-Embed models via Transformers remote code."""
+    import numpy as np
+    import pandas as pd
+    import torch
+    import torch.nn.functional as F
+    import transformers
+    from transformers import AutoModel
+    from transformers.modeling_utils import PreTrainedModel
+
+    output_file = cfg.output_dir / "train_mined.automodel.json"
+    model_name = _normalize_hf_model_name(cfg.base_model)
+
+    print(f"\n⛏️  Mining hard negatives...")
+    print(f"   Using NV-Embed model: {model_name}")
+    _ensure_nv_embed_transformers_compat(transformers.__version__)
+
+    with open(train_file, "r", encoding="utf-8") as f:
+        train_data = json.load(f)
+
+    records = train_data.get("data", [])
+    corpus_info = train_data.get("corpus", {})
+    corpus_path = Path(corpus_info.get("path", "./corpus/"))
+    if not corpus_path.is_absolute():
+        corpus_path = train_file.parent / corpus_path
+    parquet_path = corpus_path / "train.parquet"
+    if not parquet_path.exists():
+        print(f"Error: corpus parquet not found: {parquet_path}", file=sys.stderr)
+        sys.exit(1)
+
+    corpus_df = pd.read_parquet(parquet_path)
+    doc_ids = corpus_df["id"].astype(str).tolist()
+    doc_texts = corpus_df["text"].astype(str).tolist()
+    doc_id_to_index = {doc_id: idx for idx, doc_id in enumerate(doc_ids)}
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    if not hasattr(PreTrainedModel, "all_tied_weights_keys"):
+        PreTrainedModel.all_tied_weights_keys = {}
+    model = AutoModel.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        torch_dtype=dtype,
+    ).to(device)
+    if hasattr(model, "embedding_model") and hasattr(model.embedding_model, "config"):
+        model.embedding_model.config.use_cache = False
+    model.eval()
+
+    query_instruction = _nv_query_instruction(cfg.query_prefix)
+    passage_instruction = "" if cfg.passage_prefix == "passage:" else cfg.passage_prefix
+
+    def encode(
+        texts: list[str],
+        instruction: str,
+        max_length: int,
+        batch_size: int,
+    ) -> np.ndarray:
+        vectors: list[np.ndarray] = []
+        with torch.no_grad():
+            for start in range(0, len(texts), batch_size):
+                batch = texts[start:start + batch_size]
+                embeddings = model.encode(batch, instruction=instruction, max_length=max_length)
+                embeddings = F.normalize(embeddings, p=2, dim=1)
+                vectors.append(embeddings.float().cpu().numpy())
+        return np.concatenate(vectors, axis=0) if vectors else np.empty((0, 0), dtype=np.float32)
+
+    query_texts = [str(record["question"]) for record in records]
+    query_embeddings = encode(query_texts, query_instruction, cfg.query_max_length, max(1, min(cfg.mining_batch_size, 8)))
+    doc_embeddings = encode(doc_texts, passage_instruction, cfg.passage_max_length, max(1, min(cfg.mining_batch_size, 8)))
+    scores = query_embeddings @ doc_embeddings.T
+
+    _attach_hard_negatives(
+        records=records,
+        scores=scores,
+        doc_id_to_index=doc_id_to_index,
+        hard_negatives_to_mine=cfg.hard_negatives_to_mine,
+        hard_neg_margin=cfg.hard_neg_margin,
+    )
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(train_data, f, indent=2)
+
+    print(f"   Wrote mined training data: {output_file}")
+    return output_file
+
+
+def _attach_hard_negatives(
+    *,
+    records: list[dict],
+    scores,
+    doc_id_to_index: dict[str, int],
+    hard_negatives_to_mine: int,
+    hard_neg_margin: float,
+) -> None:
+    """Attach hard negatives to training records from a query-document score matrix."""
+    for row_idx, record in enumerate(records):
+        pos_ids = {str(doc.get("id")) for doc in record.get("pos_doc", [])}
+        pos_indices = [doc_id_to_index[doc_id] for doc_id in pos_ids if doc_id in doc_id_to_index]
+        min_pos_score = float(scores[row_idx, pos_indices].min()) if pos_indices else 1.0
+        cutoff = min_pos_score * hard_neg_margin
+
+        candidates: list[tuple[float, str]] = []
+        fallback: list[tuple[float, str]] = []
+        for doc_id, doc_idx in doc_id_to_index.items():
+            if doc_id in pos_ids:
+                continue
+            score = float(scores[row_idx, doc_idx])
+            fallback.append((score, doc_id))
+            if score <= cutoff:
+                candidates.append((score, doc_id))
+
+        candidates.sort(reverse=True)
+        fallback.sort(reverse=True)
+        selected = candidates[:hard_negatives_to_mine]
+        if len(selected) < hard_negatives_to_mine:
+            selected_ids = {doc_id for _, doc_id in selected}
+            selected.extend(item for item in fallback if item[1] not in selected_ids)
+            selected = selected[:hard_negatives_to_mine]
+
+        record["neg_doc"] = [{"id": doc_id} for _, doc_id in selected]
+
+
+def _nv_query_instruction(query_prefix: str) -> str:
+    """Return an NV-Embed compatible retrieval instruction prefix."""
+    if query_prefix.startswith("Instruct:"):
+        return query_prefix
+    return "Instruct: Given a question, retrieve passages that answer the question\nQuery: "
+
+
+def _ensure_nv_embed_transformers_compat(transformers_version: str) -> None:
+    """NV-Embed-v2 remote code currently targets Transformers 4.x."""
+    major_version = int(transformers_version.split(".", maxsplit=1)[0])
+    if major_version >= 5:
+        print(
+            "Error: nvidia/NV-Embed-v2 remote code is not compatible with "
+            f"transformers {transformers_version}. Re-run with "
+            "`uv run --with transformers==4.42.4 --with . ...` for the NV fallback.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _normalize_hf_model_name(model_name: str) -> str:
+    """Convert a Hugging Face model URL to its repo id."""
+    hf_prefix = "https://huggingface.co/"
+    if not model_name.startswith(hf_prefix):
+        return model_name
+    path = model_name[len(hf_prefix):].strip("/")
+    parts = path.split("/")
+    if len(parts) >= 2:
+        return "/".join(parts[:2])
+    return path
 
 
 def run_unroll(cfg: DataPrepConfig) -> Path:

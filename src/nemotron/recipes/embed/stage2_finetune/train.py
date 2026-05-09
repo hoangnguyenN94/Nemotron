@@ -143,6 +143,46 @@ def _warn_if_negatives_sparse(train_data_path: Path, train_n_passages: int) -> N
         print()
 
 
+def _normalize_hf_model_name(model_name: str) -> str:
+    """Convert a Hugging Face model URL to its repo id."""
+    hf_prefix = "https://huggingface.co/"
+    if not model_name.startswith(hf_prefix):
+        return model_name
+    path = model_name[len(hf_prefix):].strip("/")
+    parts = path.split("/")
+    if len(parts) >= 2:
+        return "/".join(parts[:2])
+    return path
+
+
+def _is_qwen_embedding_model(model_name: str) -> bool:
+    return "Qwen3-Embedding" in _normalize_hf_model_name(model_name)
+
+
+def _is_nv_embed_model(model_name: str) -> bool:
+    return "NV-Embed" in _normalize_hf_model_name(model_name)
+
+
+def _nv_query_instruction(query_prefix: str) -> str:
+    """Return an NV-Embed compatible retrieval instruction prefix."""
+    if query_prefix.startswith("Instruct:"):
+        return query_prefix
+    return "Instruct: Given a question, retrieve passages that answer the question\nQuery: "
+
+
+def _ensure_nv_embed_transformers_compat(transformers_version: str) -> None:
+    """NV-Embed-v2 remote code currently targets Transformers 4.x."""
+    major_version = int(transformers_version.split(".", maxsplit=1)[0])
+    if major_version >= 5:
+        print(
+            "Error: nvidia/NV-Embed-v2 remote code is not compatible with "
+            f"transformers {transformers_version}. Re-run with "
+            "`uv run --with transformers==4.42.4 --with . ...` for the NV fallback.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def _build_biencoder_distributed_manager(
     *,
     distributed_config,
@@ -240,6 +280,493 @@ def _auto_scale_hyperparams(
     return global_batch_size, num_epochs, checkpoint_every_steps, val_every_steps
 
 
+def _run_qwen_finetune(
+    cfg: FinetuneConfig,
+    *,
+    num_examples: int,
+    global_batch_size: int,
+    num_epochs: int,
+) -> Path:
+    """Fine-tune Qwen embedding models with a small local contrastive loop.
+
+    NeMo Automodel's biencoder path currently cannot infer Qwen3-Embedding
+    model classes, so this preserves the recipe's input/output contract while
+    using the Hugging Face model directly.
+    """
+    import pandas as pd
+    import torch
+    import torch.distributed as dist
+    import torch.nn.functional as F
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    from torch.utils.data import DataLoader
+    from torch.utils.data.distributed import DistributedSampler
+    from transformers import AutoModel, AutoTokenizer
+
+    model_name = _normalize_hf_model_name(cfg.base_model)
+    final_model_dir = cfg.checkpoint_dir / "LATEST" / "model" / "consolidated"
+    final_model_dir.mkdir(parents=True, exist_ok=True)
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+
+    if distributed and not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cpu"
+    is_rank0 = rank == 0
+
+    with open(cfg.train_data_path, encoding="utf-8") as f:
+        train_data = json.load(f)
+
+    corpus_path = Path(train_data.get("corpus", {}).get("path", "./corpus/"))
+    if not corpus_path.is_absolute():
+        corpus_path = cfg.train_data_path.parent / corpus_path
+    parquet_path = corpus_path / "train.parquet"
+    if not parquet_path.exists():
+        print(f"Error: corpus parquet not found: {parquet_path}", file=sys.stderr)
+        sys.exit(1)
+
+    corpus_df = pd.read_parquet(parquet_path)
+    corpus = {
+        str(row["id"]): str(row["text"])
+        for row in corpus_df[["id", "text"]].to_dict(orient="records")
+    }
+
+    examples: list[dict[str, object]] = []
+    needed_negatives = cfg.train_n_passages - 1
+    for record in train_data.get("data", []):
+        pos_docs = record.get("pos_doc", [])
+        neg_docs = record.get("neg_doc", [])
+        if not pos_docs or len(neg_docs) < needed_negatives:
+            continue
+        pos_id = str(pos_docs[0]["id"])
+        neg_ids = [str(doc["id"]) for doc in neg_docs[:needed_negatives]]
+        if pos_id not in corpus or any(neg_id not in corpus for neg_id in neg_ids):
+            continue
+        examples.append(
+            {
+                "query": str(record["question"]),
+                "passages": [corpus[pos_id], *(corpus[neg_id] for neg_id in neg_ids)],
+            }
+        )
+
+    if not examples:
+        print("Error: no usable training examples after resolving corpus documents.", file=sys.stderr)
+        sys.exit(1)
+
+    dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+    batch_size = max(1, min(cfg.local_batch_size, len(examples)))
+    per_rank_examples = (len(examples) + world_size - 1) // world_size
+    steps_per_epoch = max(1, (per_rank_examples + batch_size - 1) // batch_size)
+    total_steps = steps_per_epoch * num_epochs
+
+    if is_rank0:
+        print("Using Hugging Face Qwen fine-tune fallback")
+        print(f"  Model:             {model_name}")
+        print(f"  Distributed:       {distributed} (world_size={world_size})")
+        print(f"  Device:            {device}")
+        print(f"  Local batch size:  {batch_size}")
+        print(f"  Effective batch:   {batch_size * world_size}")
+        print(f"  Steps/epoch:       {steps_per_epoch}")
+        print(f"  Total steps:       {total_steps}")
+        print()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
+    model = AutoModel.from_pretrained(
+        model_name,
+        torch_dtype=dtype,
+        attn_implementation=cfg.attn_implementation or "sdpa",
+    ).to(device)
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+    model.train()
+    train_model = model
+    if distributed:
+        train_model = DDP(
+            model,
+            device_ids=[local_rank] if device.startswith("cuda") else None,
+            output_device=local_rank if device.startswith("cuda") else None,
+            find_unused_parameters=False,
+        )
+
+    optimizer = torch.optim.AdamW(
+        train_model.parameters(),
+        lr=cfg.learning_rate,
+        weight_decay=cfg.weight_decay,
+    )
+
+    def last_token_pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        left_padding = attention_mask[:, -1].sum() == attention_mask.shape[0]
+        if left_padding:
+            return last_hidden_states[:, -1]
+        sequence_lengths = attention_mask.sum(dim=1) - 1
+        batch = last_hidden_states.shape[0]
+        return last_hidden_states[torch.arange(batch, device=last_hidden_states.device), sequence_lengths]
+
+    def encode(texts: list[str], max_length: int) -> torch.Tensor:
+        inputs = tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        ).to(device)
+        outputs = train_model(**inputs)
+        embeddings = last_token_pool(outputs.last_hidden_state, inputs["attention_mask"])
+        if cfg.l2_normalize:
+            embeddings = F.normalize(embeddings, p=2, dim=1)
+        return embeddings
+
+    def collate(batch: list[dict[str, object]]) -> dict[str, list[str]]:
+        queries = [f"{cfg.query_prefix} {item['query']}".strip() for item in batch]
+        passages: list[str] = []
+        for item in batch:
+            passages.extend(
+                f"{cfg.passage_prefix} {passage}".strip()
+                for passage in item["passages"]  # type: ignore[index]
+            )
+        return {"queries": queries, "passages": passages}
+
+    step = 0
+    for epoch in range(num_epochs):
+        sampler = DistributedSampler(
+            examples,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=42,
+        ) if distributed else None
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+        loader = DataLoader(
+            examples,
+            batch_size=batch_size,
+            shuffle=(sampler is None),
+            sampler=sampler,
+            collate_fn=collate,
+        )
+        for batch in loader:
+            step += 1
+            query_embeddings = encode(batch["queries"], cfg.query_max_length)
+            passage_embeddings = encode(batch["passages"], cfg.passage_max_length)
+            passage_embeddings = passage_embeddings.view(
+                len(batch["queries"]),
+                cfg.train_n_passages,
+                -1,
+            )
+            logits = torch.einsum("bd,bpd->bp", query_embeddings, passage_embeddings) / cfg.temperature
+            labels = torch.zeros(logits.shape[0], dtype=torch.long, device=device)
+            loss = F.cross_entropy(logits, labels)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            loss_for_log = loss.detach()
+            if distributed:
+                dist.all_reduce(loss_for_log, op=dist.ReduceOp.AVG)
+            if is_rank0:
+                print(
+                    f"epoch={epoch + 1}/{num_epochs} "
+                    f"step={step}/{total_steps} loss={loss_for_log.item():.4f}"
+                )
+
+    if distributed:
+        dist.barrier()
+
+    if is_rank0:
+        print(f"\nSaving Qwen fine-tuned model to {final_model_dir}")
+        model_to_save = train_model.module if isinstance(train_model, DDP) else train_model
+        model_to_save.save_pretrained(final_model_dir, safe_serialization=True)
+        tokenizer.save_pretrained(final_model_dir)
+        metadata_path = cfg.checkpoint_dir / "LATEST" / "training_metadata.json"
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "base_model": model_name,
+                    "training_examples": num_examples,
+                    "usable_training_examples": len(examples),
+                    "num_epochs": num_epochs,
+                    "global_batch_size": global_batch_size,
+                    "local_batch_size": batch_size,
+                    "effective_batch_size": batch_size * world_size,
+                    "world_size": world_size,
+                    "learning_rate": cfg.learning_rate,
+                    "temperature": cfg.temperature,
+                    "train_n_passages": cfg.train_n_passages,
+                },
+                f,
+                indent=2,
+            )
+
+        print(f"\nFine-tuning complete!")
+        print(f"   Checkpoint: {cfg.checkpoint_dir}")
+        print(f"   Model:      {final_model_dir}")
+
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
+
+    return final_model_dir
+
+
+def _run_nv_embed_finetune(
+    cfg: FinetuneConfig,
+    *,
+    num_examples: int,
+    global_batch_size: int,
+    num_epochs: int,
+) -> Path:
+    """Fine-tune NV-Embed models with their remote-code latent pooling."""
+    import pandas as pd
+    import torch
+    import torch.distributed as dist
+    import torch.nn.functional as F
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    from torch.utils.data import DataLoader
+    from torch.utils.data.distributed import DistributedSampler
+    import transformers
+    from transformers import AutoModel
+    from transformers.modeling_utils import PreTrainedModel
+
+    model_name = _normalize_hf_model_name(cfg.base_model)
+    _ensure_nv_embed_transformers_compat(transformers.__version__)
+    final_model_dir = cfg.checkpoint_dir / "LATEST" / "model" / "consolidated"
+    final_model_dir.mkdir(parents=True, exist_ok=True)
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+
+    if distributed and not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        torch.set_autocast_gpu_dtype(torch.bfloat16)
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cpu"
+    is_rank0 = rank == 0
+
+    with open(cfg.train_data_path, encoding="utf-8") as f:
+        train_data = json.load(f)
+
+    corpus_path = Path(train_data.get("corpus", {}).get("path", "./corpus/"))
+    if not corpus_path.is_absolute():
+        corpus_path = cfg.train_data_path.parent / corpus_path
+    parquet_path = corpus_path / "train.parquet"
+    if not parquet_path.exists():
+        print(f"Error: corpus parquet not found: {parquet_path}", file=sys.stderr)
+        sys.exit(1)
+
+    corpus_df = pd.read_parquet(parquet_path)
+    corpus = {
+        str(row["id"]): str(row["text"])
+        for row in corpus_df[["id", "text"]].to_dict(orient="records")
+    }
+
+    examples: list[dict[str, object]] = []
+    needed_negatives = cfg.train_n_passages - 1
+    for record in train_data.get("data", []):
+        pos_docs = record.get("pos_doc", [])
+        neg_docs = record.get("neg_doc", [])
+        if not pos_docs or len(neg_docs) < needed_negatives:
+            continue
+        pos_id = str(pos_docs[0]["id"])
+        neg_ids = [str(doc["id"]) for doc in neg_docs[:needed_negatives]]
+        if pos_id not in corpus or any(neg_id not in corpus for neg_id in neg_ids):
+            continue
+        examples.append(
+            {
+                "query": str(record["question"]),
+                "passages": [corpus[pos_id], *(corpus[neg_id] for neg_id in neg_ids)],
+            }
+        )
+
+    if not examples:
+        print("Error: no usable training examples after resolving corpus documents.", file=sys.stderr)
+        sys.exit(1)
+
+    # Use bf16 on CUDA: fp16 produced NaNs, while fp32 plus AdamW states is too
+    # memory-heavy for DDP full-model training.
+    dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+    batch_size = max(1, min(cfg.local_batch_size, len(examples)))
+    per_rank_examples = (len(examples) + world_size - 1) // world_size
+    steps_per_epoch = max(1, (per_rank_examples + batch_size - 1) // batch_size)
+    total_steps = steps_per_epoch * num_epochs
+
+    if is_rank0:
+        print("Using Hugging Face NV-Embed fine-tune fallback")
+        print(f"  Model:             {model_name}")
+        print(f"  Distributed:       {distributed} (world_size={world_size})")
+        print(f"  Device:            {device}")
+        print(f"  Local batch size:  {batch_size}")
+        print(f"  Effective batch:   {batch_size * world_size}")
+        print(f"  Steps/epoch:       {steps_per_epoch}")
+        print(f"  Total steps:       {total_steps}")
+        print()
+
+    if not hasattr(PreTrainedModel, "all_tied_weights_keys"):
+        PreTrainedModel.all_tied_weights_keys = {}
+    model = AutoModel.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        torch_dtype=dtype,
+    ).to(device)
+    if hasattr(model, "embedding_model") and hasattr(model.embedding_model, "config"):
+        model.embedding_model.config.use_cache = False
+    if (
+        not distributed
+        and hasattr(model, "embedding_model")
+        and hasattr(model.embedding_model, "gradient_checkpointing_enable")
+    ):
+        model.embedding_model.gradient_checkpointing_enable()
+    model.train()
+    train_model = model
+    if distributed:
+        train_model = DDP(
+            model,
+            device_ids=[local_rank] if device.startswith("cuda") else None,
+            output_device=local_rank if device.startswith("cuda") else None,
+            find_unused_parameters=False,
+        )
+
+    optimizer = torch.optim.AdamW(
+        train_model.parameters(),
+        lr=cfg.learning_rate,
+        weight_decay=cfg.weight_decay,
+        foreach=False,
+    )
+
+    query_instruction = _nv_query_instruction(cfg.query_prefix)
+    passage_instruction = "" if cfg.passage_prefix == "passage:" else cfg.passage_prefix
+
+    def encode(texts: list[str], instruction: str, max_length: int) -> torch.Tensor:
+        tokenizer = model.tokenizer
+        input_texts = [
+            f"{instruction}{text}{tokenizer.eos_token if model.add_eos else ''}"
+            for text in texts
+        ]
+        batch_dict = tokenizer(
+            input_texts,
+            max_length=max_length,
+            padding=True,
+            return_token_type_ids=False,
+            return_tensors="pt",
+            truncation=True,
+        )
+        if model.padding_side == "right" and model.is_mask_instruction and instruction:
+            instruction_lens = len(tokenizer.tokenize(instruction))
+        else:
+            instruction_lens = 0
+        features = model.prepare_kwargs_from_batch(batch_dict, instruction_lens, device=torch.device(device))
+        embeddings = train_model(**features)["sentence_embeddings"].squeeze(1)
+        if cfg.l2_normalize:
+            embeddings = F.normalize(embeddings, p=2, dim=1)
+        return embeddings
+
+    def collate(batch: list[dict[str, object]]) -> dict[str, list[str]]:
+        queries = [str(item["query"]) for item in batch]
+        passages: list[str] = []
+        for item in batch:
+            passages.extend(str(passage) for passage in item["passages"])  # type: ignore[index]
+        return {"queries": queries, "passages": passages}
+
+    step = 0
+    for epoch in range(num_epochs):
+        sampler = DistributedSampler(
+            examples,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=42,
+        ) if distributed else None
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+        loader = DataLoader(
+            examples,
+            batch_size=batch_size,
+            shuffle=(sampler is None),
+            sampler=sampler,
+            collate_fn=collate,
+        )
+        for batch in loader:
+            step += 1
+            query_embeddings = encode(batch["queries"], query_instruction, cfg.query_max_length)
+            passage_embeddings = encode(batch["passages"], passage_instruction, cfg.passage_max_length)
+            passage_embeddings = passage_embeddings.view(
+                len(batch["queries"]),
+                cfg.train_n_passages,
+                -1,
+            )
+            logits = torch.einsum("bd,bpd->bp", query_embeddings, passage_embeddings) / cfg.temperature
+            labels = torch.zeros(logits.shape[0], dtype=torch.long, device=device)
+            loss = F.cross_entropy(logits, labels)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            loss_for_log = loss.detach()
+            if distributed:
+                dist.all_reduce(loss_for_log, op=dist.ReduceOp.AVG)
+            if is_rank0:
+                print(
+                    f"epoch={epoch + 1}/{num_epochs} "
+                    f"step={step}/{total_steps} loss={loss_for_log.item():.4f}"
+                )
+
+    if distributed:
+        dist.barrier()
+
+    if is_rank0:
+        print(f"\nSaving NV-Embed fine-tuned model to {final_model_dir}")
+        model_to_save = train_model.module if isinstance(train_model, DDP) else train_model
+        model_to_save.save_pretrained(final_model_dir, safe_serialization=True)
+        model.tokenizer.save_pretrained(final_model_dir)
+        metadata_path = cfg.checkpoint_dir / "LATEST" / "training_metadata.json"
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "base_model": model_name,
+                    "training_examples": num_examples,
+                    "usable_training_examples": len(examples),
+                    "num_epochs": num_epochs,
+                    "global_batch_size": global_batch_size,
+                    "local_batch_size": batch_size,
+                    "effective_batch_size": batch_size * world_size,
+                    "world_size": world_size,
+                    "learning_rate": cfg.learning_rate,
+                    "temperature": cfg.temperature,
+                    "train_n_passages": cfg.train_n_passages,
+                },
+                f,
+                indent=2,
+            )
+
+        print(f"\nFine-tuning complete!")
+        print(f"   Checkpoint: {cfg.checkpoint_dir}")
+        print(f"   Model:      {final_model_dir}")
+
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
+
+    return final_model_dir
+
+
 def run_finetune(cfg: FinetuneConfig) -> Path:
     """Run embedding model fine-tuning using nemo-automodel.
 
@@ -299,6 +826,21 @@ def run_finetune(cfg: FinetuneConfig) -> Path:
     print(f"Training data:  {cfg.train_data_path}")
     print(f"Checkpoint dir: {cfg.checkpoint_dir}")
     print()
+
+    if _is_qwen_embedding_model(cfg.base_model):
+        return _run_qwen_finetune(
+            cfg,
+            num_examples=num_examples,
+            global_batch_size=global_batch_size,
+            num_epochs=num_epochs,
+        )
+    if _is_nv_embed_model(cfg.base_model):
+        return _run_nv_embed_finetune(
+            cfg,
+            num_examples=num_examples,
+            global_batch_size=global_batch_size,
+            num_epochs=num_epochs,
+        )
 
     # Import nemo-automodel components
     try:

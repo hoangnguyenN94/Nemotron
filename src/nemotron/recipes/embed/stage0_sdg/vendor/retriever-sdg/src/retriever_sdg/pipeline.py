@@ -1731,6 +1731,8 @@ def generate(
     quality_judge_provider: str = "nvidia",
     embed_model: str = "nvidia/llama-3.2-nv-embedqa-1b-v2",
     embed_provider: str = "nvidia",
+    embed_provider_endpoint: Optional[str] = None,
+    embed_api_key_env: str = "VLLM_API_KEY",
 ) -> None:
     """Generate synthetic queries from a directory of text files.
     
@@ -1772,6 +1774,8 @@ def generate(
         quality_judge_provider: Provider for quality judge model (default: nvidia)
         embed_model: Model name for embeddings (default: nvidia/llama-3.2-nv-embedqa-1b-v2)
         embed_provider: Provider for embedding model (default: nvidia)
+        embed_provider_endpoint: Optional OpenAI-compatible endpoint for a custom embedding provider
+        embed_api_key_env: Environment variable name containing the custom embedding provider API key
     Examples:
         # Generate from text files (processes all in batches of 200)
         retriever-sdg generate \\
@@ -1846,9 +1850,24 @@ def generate(
         )
     )
 
+    model_providers = None
+    if embed_provider_endpoint:
+        from data_designer.interface.data_designer import get_default_providers
+
+        model_providers = [
+            *get_default_providers(),
+            dd.ModelProvider(
+                name=embed_provider,
+                endpoint=embed_provider_endpoint,
+                provider_type="openai",
+                api_key=embed_api_key_env,
+            )
+        ]
+
     # Initialize Data Designer
     data_designer = DataDesigner(
         artifact_path=artifact_path,
+        model_providers=model_providers,
     )
     data_designer.set_run_config(dd.RunConfig(disable_early_shutdown=True))
 

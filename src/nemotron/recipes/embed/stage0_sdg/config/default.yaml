@@ -113,20 +113,22 @@ max_docs_per_bundle: 3
 # ==============================================================================
 
 # Artifact extraction
-artifact_extraction_model: nvidia/nemotron-3-nano-30b-a3b
+artifact_extraction_model: openai/gpt-oss-120b
 artifact_extraction_provider: nvidia
 
 # QA generation
-qa_generation_model: nvidia/nemotron-3-nano-30b-a3b
+qa_generation_model: openai/gpt-oss-120b
 qa_generation_provider: nvidia
 
 # Quality judge
-quality_judge_model: nvidia/nemotron-3-nano-30b-a3b
+quality_judge_model: openai/gpt-oss-120b
 quality_judge_provider: nvidia
 
 # Embedding
-embed_model: nvidia/llama-3.2-nv-embedqa-1b-v2
-embed_provider: nvidia
+embed_model: Qwen/Qwen3-Embedding-8B
+embed_provider: qwen-vllm
+embed_provider_endpoint: http://127.0.0.1:6006/v1
+embed_api_key_env: VLLM_API_KEY
 
 # Maximum parallel requests for generation models (null = library default)
 # max_parallel_requests_for_gen: null

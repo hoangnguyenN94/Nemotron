@@ -128,6 +128,8 @@ class SDGConfig(RecipeSettings):
     quality_judge_provider: str = Field(default="nvidia", description="Provider for quality judge model.")
     embed_model: str = Field(default="nvidia/llama-3.2-nv-embedqa-1b-v2", description="Model name for embeddings.")
     embed_provider: str = Field(default="nvidia", description="Provider for embedding model.")
+    embed_provider_endpoint: str | None = Field(default=None, description="Optional OpenAI-compatible endpoint for a custom embedding provider.")
+    embed_api_key_env: str = Field(default="VLLM_API_KEY", description="Environment variable name containing the custom embedding provider API key.")
     max_parallel_requests_for_gen: int | None = Field(default=None, gt=0, description="Maximum parallel requests for generation models. None uses the library default.")
 
     # --- Runtime options -------------------------------------------------------
@@ -422,6 +424,8 @@ def run_sdg(cfg: SDGConfig) -> Path:
             quality_judge_provider=cfg.quality_judge_provider,
             embed_model=cfg.embed_model,
             embed_provider=cfg.embed_provider,
+            embed_provider_endpoint=cfg.embed_provider_endpoint,
+            embed_api_key_env=cfg.embed_api_key_env,
         )
     except FileNotFoundError as exc:
         print(f"\nError: SDG pipeline could not find an intermediate file.", file=sys.stderr)
