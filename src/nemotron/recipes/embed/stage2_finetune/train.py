@@ -383,6 +383,7 @@ def _run_qwen_finetune(
         model_name,
         torch_dtype=dtype,
         attn_implementation=cfg.attn_implementation or "sdpa",
+        low_cpu_mem_usage=True,
     ).to(device)
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
@@ -623,14 +624,11 @@ def _run_nv_embed_finetune(
         model_name,
         trust_remote_code=True,
         torch_dtype=dtype,
+        low_cpu_mem_usage=True,
     ).to(device)
     if hasattr(model, "embedding_model") and hasattr(model.embedding_model, "config"):
         model.embedding_model.config.use_cache = False
-    if (
-        not distributed
-        and hasattr(model, "embedding_model")
-        and hasattr(model.embedding_model, "gradient_checkpointing_enable")
-    ):
+    if hasattr(model, "embedding_model") and hasattr(model.embedding_model, "gradient_checkpointing_enable"):
         model.embedding_model.gradient_checkpointing_enable()
     model.train()
     train_model = model
