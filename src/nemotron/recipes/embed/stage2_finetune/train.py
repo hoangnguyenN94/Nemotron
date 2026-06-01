@@ -235,6 +235,94 @@ def _build_biencoder_distributed_manager(
     raise ValueError(f"Unknown distributed config type: {type(distributed_config)}")
 
 
+def _should_use_fsdp(distributed: bool, device: str) -> bool:
+    """Whether to use FSDP for local fallback training loops."""
+    return distributed and device.startswith("cuda") and os.environ.get("NEMOTRON_USE_FSDP", "1") != "0"
+
+
+def _wrap_train_model(
+    model,
+    *,
+    device: str,
+    local_rank: int,
+    distributed: bool,
+    dtype,
+):
+    """Wrap a model with FSDP when possible, otherwise DDP."""
+    if not distributed:
+        return model, "single"
+
+    if _should_use_fsdp(distributed, device):
+        from functools import partial
+
+        import torch
+        from torch.distributed.fsdp import (
+            BackwardPrefetch,
+            FullyShardedDataParallel as FSDP,
+            MixedPrecision,
+            ShardingStrategy,
+        )
+        from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+
+        mixed_precision = None
+        if device.startswith("cuda"):
+            mixed_precision = MixedPrecision(
+                param_dtype=dtype,
+                reduce_dtype=dtype,
+                buffer_dtype=dtype,
+            )
+
+        auto_wrap_policy = partial(
+            size_based_auto_wrap_policy,
+            min_num_params=int(os.environ.get("NEMOTRON_FSDP_MIN_NUM_PARAMS", "100000000")),
+        )
+
+        wrapped = FSDP(
+            model,
+            auto_wrap_policy=auto_wrap_policy,
+            mixed_precision=mixed_precision,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+            device_id=torch.device(device) if device.startswith("cuda") else None,
+            limit_all_gathers=True,
+            sync_module_states=False,
+            use_orig_params=True,
+        )
+        return wrapped, "FSDP"
+
+    from torch.nn.parallel import DistributedDataParallel as DDP
+
+    wrapped = DDP(
+        model,
+        device_ids=[local_rank] if device.startswith("cuda") else None,
+        output_device=local_rank if device.startswith("cuda") else None,
+        find_unused_parameters=False,
+    )
+    return wrapped, "DDP"
+
+
+def _prepare_model_for_save(train_model, model):
+    """Return the model object and optional full state dict for saving."""
+    try:
+        from torch.distributed.fsdp import (
+            FullStateDictConfig,
+            FullyShardedDataParallel as FSDP,
+            StateDictType,
+        )
+    except ImportError:
+        FSDP = None  # type: ignore[assignment]
+
+    if FSDP is not None and isinstance(train_model, FSDP):
+        full_state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(train_model, StateDictType.FULL_STATE_DICT, full_state_cfg):
+            state_dict = train_model.state_dict()
+        return model, state_dict
+
+    if hasattr(train_model, "module"):
+        return train_model.module, None
+    return train_model, None
+
+
 def _auto_scale_hyperparams(
     cfg: FinetuneConfig, num_examples: int
 ) -> tuple[int, int, int, int]:
@@ -388,14 +476,15 @@ def _run_qwen_finetune(
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
     model.train()
-    train_model = model
-    if distributed:
-        train_model = DDP(
-            model,
-            device_ids=[local_rank] if device.startswith("cuda") else None,
-            output_device=local_rank if device.startswith("cuda") else None,
-            find_unused_parameters=False,
-        )
+    train_model, parallelism = _wrap_train_model(
+        model,
+        device=device,
+        local_rank=local_rank,
+        distributed=distributed,
+        dtype=dtype,
+    )
+    if is_rank0:
+        print(f"  Parallelism:       {parallelism}")
 
     optimizer = torch.optim.AdamW(
         train_model.parameters(),
@@ -482,10 +571,14 @@ def _run_qwen_finetune(
     if distributed:
         dist.barrier()
 
+    model_to_save, save_state_dict = _prepare_model_for_save(train_model, model)
     if is_rank0:
         print(f"\nSaving Qwen fine-tuned model to {final_model_dir}")
-        model_to_save = train_model.module if isinstance(train_model, DDP) else train_model
-        model_to_save.save_pretrained(final_model_dir, safe_serialization=True)
+        model_to_save.save_pretrained(
+            final_model_dir,
+            safe_serialization=True,
+            state_dict=save_state_dict,
+        )
         tokenizer.save_pretrained(final_model_dir)
         metadata_path = cfg.checkpoint_dir / "LATEST" / "training_metadata.json"
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
@@ -631,14 +724,15 @@ def _run_nv_embed_finetune(
     if hasattr(model, "embedding_model") and hasattr(model.embedding_model, "gradient_checkpointing_enable"):
         model.embedding_model.gradient_checkpointing_enable()
     model.train()
-    train_model = model
-    if distributed:
-        train_model = DDP(
-            model,
-            device_ids=[local_rank] if device.startswith("cuda") else None,
-            output_device=local_rank if device.startswith("cuda") else None,
-            find_unused_parameters=False,
-        )
+    train_model, parallelism = _wrap_train_model(
+        model,
+        device=device,
+        local_rank=local_rank,
+        distributed=distributed,
+        dtype=dtype,
+    )
+    if is_rank0:
+        print(f"  Parallelism:       {parallelism}")
 
     optimizer = torch.optim.AdamW(
         train_model.parameters(),
@@ -728,10 +822,14 @@ def _run_nv_embed_finetune(
     if distributed:
         dist.barrier()
 
+    model_to_save, save_state_dict = _prepare_model_for_save(train_model, model)
     if is_rank0:
         print(f"\nSaving NV-Embed fine-tuned model to {final_model_dir}")
-        model_to_save = train_model.module if isinstance(train_model, DDP) else train_model
-        model_to_save.save_pretrained(final_model_dir, safe_serialization=True)
+        model_to_save.save_pretrained(
+            final_model_dir,
+            safe_serialization=True,
+            state_dict=save_state_dict,
+        )
         model.tokenizer.save_pretrained(final_model_dir)
         metadata_path = cfg.checkpoint_dir / "LATEST" / "training_metadata.json"
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
