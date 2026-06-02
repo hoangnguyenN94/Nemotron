@@ -281,15 +281,17 @@ def _load_pretrained_for_distributed(
     load_strategy = _distributed_model_load_strategy()
     use_rank0_sync = use_fsdp and device.startswith("cuda") and load_strategy != "stagger"
 
+    trc = bool(trust_remote_code or load_kwargs.get("trust_remote_code", False))
+
     if use_rank0_sync:
         if is_rank0:
-            print("  Model load:        rank0_sync (only rank 0 reads checkpoint shards)")
+            print("  Model load:        rank0_sync (only rank 0 reads checkpoint shards; others build on meta)")
         if rank == 0:
             model = _load_full_model()
         else:
             config = AutoConfig.from_pretrained(
                 model_name,
-                trust_remote_code=trust_remote_code,
+                trust_remote_code=trc,
             )
             config_kwargs = {
                 key: value
@@ -300,12 +302,17 @@ def _load_pretrained_for_distributed(
                     "trust_remote_code",
                 }
             }
-            model = AutoModel.from_config(
-                config,
-                trust_remote_code=trust_remote_code or load_kwargs.get("trust_remote_code", False),
-                **config_kwargs,
-            )
-            model = model.to_empty(device="cpu")
+            # Build the module structure on the meta device so non-zero ranks
+            # allocate (almost) no host RAM. FSDP(sync_module_states=True) with a
+            # param_init_fn materializes these tensors directly on GPU and
+            # broadcasts rank 0's weights, so we never hold the full model in CPU
+            # RAM on more than one process at a time.
+            with torch.device("meta"):
+                model = AutoModel.from_config(
+                    config,
+                    trust_remote_code=trc,
+                    **config_kwargs,
+                )
         dist.barrier()
         gc.collect()
         return model
@@ -365,11 +372,25 @@ def _wrap_train_model(
             min_num_params=int(os.environ.get("NEMOTRON_FSDP_MIN_NUM_PARAMS", "100000000")),
         )
 
+        # Detect meta-initialized parameters (rank0_sync builds non-zero ranks on
+        # the meta device). Those ranks must materialize on GPU via param_init_fn
+        # and receive real weights from rank 0 through sync_module_states.
+        has_meta_params = any(p.is_meta for p in model.parameters())
+
         if sync_module_states is None:
             sync_module_states = (
                 _distributed_model_load_strategy() != "stagger"
                 and os.environ.get("NEMOTRON_FSDP_SYNC_MODULE_STATES", "1") != "0"
             )
+        if has_meta_params:
+            sync_module_states = True
+
+        param_init_fn = None
+        if has_meta_params and device.startswith("cuda"):
+            target_device = torch.device(device)
+
+            def param_init_fn(module):
+                module.to_empty(device=target_device, recurse=False)
 
         wrapped = FSDP(
             model,
@@ -381,6 +402,7 @@ def _wrap_train_model(
             limit_all_gathers=True,
             sync_module_states=sync_module_states,
             use_orig_params=True,
+            param_init_fn=param_init_fn,
         )
         return wrapped, "FSDP"
 
