@@ -240,6 +240,89 @@ def _should_use_fsdp(distributed: bool, device: str) -> bool:
     return distributed and device.startswith("cuda") and os.environ.get("NEMOTRON_USE_FSDP", "1") != "0"
 
 
+def _distributed_model_load_strategy() -> str:
+    """How to load pretrained weights before FSDP/DDP wrapping.
+
+    rank0_sync (default): only rank 0 reads checkpoint shards from disk; other
+    ranks build an empty shell and FSDP broadcasts weights. This avoids CPU
+    RAM spikes when multiple processes load large models concurrently.
+
+    stagger: ranks load the checkpoint one at a time. Useful as a fallback when
+    rank0_sync cannot build the model from config alone (some remote-code models).
+    """
+    return os.environ.get("NEMOTRON_MODEL_LOAD", "rank0_sync").lower()
+
+
+def _load_pretrained_for_distributed(
+    *,
+    model_name: str,
+    rank: int,
+    world_size: int,
+    distributed: bool,
+    use_fsdp: bool,
+    device: str,
+    load_kwargs: dict,
+    trust_remote_code: bool = False,
+    is_rank0: bool = False,
+):
+    """Load a pretrained model without every rank duplicating checkpoint I/O."""
+    import gc
+
+    import torch
+    import torch.distributed as dist
+    from transformers import AutoConfig, AutoModel
+
+    def _load_full_model():
+        return AutoModel.from_pretrained(model_name, **load_kwargs)
+
+    if not distributed:
+        return _load_full_model().to(device)
+
+    load_strategy = _distributed_model_load_strategy()
+    use_rank0_sync = use_fsdp and device.startswith("cuda") and load_strategy != "stagger"
+
+    if use_rank0_sync:
+        if is_rank0:
+            print("  Model load:        rank0_sync (only rank 0 reads checkpoint shards)")
+        if rank == 0:
+            model = _load_full_model()
+        else:
+            config = AutoConfig.from_pretrained(
+                model_name,
+                trust_remote_code=trust_remote_code,
+            )
+            config_kwargs = {
+                key: value
+                for key, value in load_kwargs.items()
+                if key not in {"low_cpu_mem_usage"}
+            }
+            model = AutoModel.from_config(
+                config,
+                trust_remote_code=trust_remote_code,
+                **config_kwargs,
+            )
+            model = model.to_empty(device="cpu")
+        dist.barrier()
+        gc.collect()
+        return model
+
+    if is_rank0:
+        print(
+            f"  Model load:        stagger "
+            f"(ranks load checkpoint sequentially; set NEMOTRON_MODEL_LOAD=rank0_sync to prefer rank-0-only load)"
+        )
+    model = None
+    for loading_rank in range(world_size):
+        if rank == loading_rank:
+            model = _load_full_model()
+        dist.barrier()
+    gc.collect()
+    assert model is not None
+    if use_fsdp and device.startswith("cuda"):
+        return model
+    return model.to(device)
+
+
 def _wrap_train_model(
     model,
     *,
@@ -247,6 +330,7 @@ def _wrap_train_model(
     local_rank: int,
     distributed: bool,
     dtype,
+    sync_module_states: bool | None = None,
 ):
     """Wrap a model with FSDP when possible, otherwise DDP."""
     if not distributed:
@@ -277,6 +361,12 @@ def _wrap_train_model(
             min_num_params=int(os.environ.get("NEMOTRON_FSDP_MIN_NUM_PARAMS", "100000000")),
         )
 
+        if sync_module_states is None:
+            sync_module_states = (
+                _distributed_model_load_strategy() != "stagger"
+                and os.environ.get("NEMOTRON_FSDP_SYNC_MODULE_STATES", "1") != "0"
+            )
+
         wrapped = FSDP(
             model,
             auto_wrap_policy=auto_wrap_policy,
@@ -285,7 +375,7 @@ def _wrap_train_model(
             backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
             device_id=torch.device(device) if device.startswith("cuda") else None,
             limit_all_gathers=True,
-            sync_module_states=False,
+            sync_module_states=sync_module_states,
             use_orig_params=True,
         )
         return wrapped, "FSDP"
@@ -466,13 +556,24 @@ def _run_qwen_finetune(
         print(f"  Total steps:       {total_steps}")
         print()
 
+    use_fsdp = _should_use_fsdp(distributed, device)
     tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
-    model = AutoModel.from_pretrained(
-        model_name,
-        torch_dtype=dtype,
-        attn_implementation=cfg.attn_implementation or "sdpa",
-        low_cpu_mem_usage=True,
-    ).to(device)
+    model = _load_pretrained_for_distributed(
+        model_name=model_name,
+        rank=rank,
+        world_size=world_size,
+        distributed=distributed,
+        use_fsdp=use_fsdp,
+        device=device,
+        load_kwargs={
+            "torch_dtype": dtype,
+            "attn_implementation": cfg.attn_implementation or "sdpa",
+            "low_cpu_mem_usage": True,
+        },
+        is_rank0=is_rank0,
+    )
+    if not (distributed and use_fsdp):
+        model = model.to(device)
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
     model.train()
@@ -713,12 +814,24 @@ def _run_nv_embed_finetune(
 
     if not hasattr(PreTrainedModel, "all_tied_weights_keys"):
         PreTrainedModel.all_tied_weights_keys = {}
-    model = AutoModel.from_pretrained(
-        model_name,
+    use_fsdp = _should_use_fsdp(distributed, device)
+    model = _load_pretrained_for_distributed(
+        model_name=model_name,
+        rank=rank,
+        world_size=world_size,
+        distributed=distributed,
+        use_fsdp=use_fsdp,
+        device=device,
+        load_kwargs={
+            "trust_remote_code": True,
+            "torch_dtype": dtype,
+            "low_cpu_mem_usage": True,
+        },
         trust_remote_code=True,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-    ).to(device)
+        is_rank0=is_rank0,
+    )
+    if not (distributed and use_fsdp):
+        model = model.to(device)
     if hasattr(model, "embedding_model") and hasattr(model.embedding_model, "config"):
         model.embedding_model.config.use_cache = False
     if hasattr(model, "embedding_model") and hasattr(model.embedding_model, "gradient_checkpointing_enable"):
