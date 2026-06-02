@@ -240,6 +240,29 @@ def _should_use_fsdp(distributed: bool, device: str) -> bool:
     return distributed and device.startswith("cuda") and os.environ.get("NEMOTRON_USE_FSDP", "1") != "0"
 
 
+def _enable_gradient_checkpointing(module, *, use_fsdp: bool) -> None:
+    """Enable gradient checkpointing in an FSDP-safe way.
+
+    Reentrant activation checkpointing (the HF default) reshards FSDP parameters
+    before the backward recomputation re-gathers them, leaving 0-sized weights and
+    raising shape mismatches in modules like RMSNorm. ``use_reentrant=False`` runs
+    the recomputation inside FSDP's gathered context, so it is required whenever
+    FSDP wraps the model.
+    """
+    if module is None or not hasattr(module, "gradient_checkpointing_enable"):
+        return
+    if use_fsdp:
+        try:
+            module.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            return
+        except TypeError:
+            # Older transformers signatures without gradient_checkpointing_kwargs.
+            pass
+    module.gradient_checkpointing_enable()
+
+
 def _distributed_model_load_strategy() -> str:
     """How to load pretrained weights before FSDP/DDP wrapping.
 
@@ -600,8 +623,7 @@ def _run_qwen_finetune(
     )
     if not (distributed and use_fsdp):
         model = model.to(device)
-    if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
+    _enable_gradient_checkpointing(model, use_fsdp=distributed and use_fsdp)
     model.train()
     train_model, parallelism = _wrap_train_model(
         model,
@@ -860,8 +882,10 @@ def _run_nv_embed_finetune(
         model = model.to(device)
     if hasattr(model, "embedding_model") and hasattr(model.embedding_model, "config"):
         model.embedding_model.config.use_cache = False
-    if hasattr(model, "embedding_model") and hasattr(model.embedding_model, "gradient_checkpointing_enable"):
-        model.embedding_model.gradient_checkpointing_enable()
+    if hasattr(model, "embedding_model"):
+        _enable_gradient_checkpointing(
+            model.embedding_model, use_fsdp=distributed and use_fsdp
+        )
     model.train()
     train_model, parallelism = _wrap_train_model(
         model,
