@@ -294,11 +294,15 @@ def _load_pretrained_for_distributed(
             config_kwargs = {
                 key: value
                 for key, value in load_kwargs.items()
-                if key not in {"low_cpu_mem_usage"}
+                if key
+                not in {
+                    "low_cpu_mem_usage",
+                    "trust_remote_code",
+                }
             }
             model = AutoModel.from_config(
                 config,
-                trust_remote_code=trust_remote_code,
+                trust_remote_code=trust_remote_code or load_kwargs.get("trust_remote_code", False),
                 **config_kwargs,
             )
             model = model.to_empty(device="cpu")
