@@ -263,6 +263,38 @@ def _enable_gradient_checkpointing(module, *, use_fsdp: bool) -> None:
     module.gradient_checkpointing_enable()
 
 
+def _init_process_group_with_device(local_rank: int) -> None:
+    """Initialize the default process group, binding NCCL to the local GPU.
+
+    The device must be selected (and passed as ``device_id``) before the first
+    collective. Otherwise PyTorch falls back to "guessing the device id based on
+    global rank", which both emits a warning and can hang multi-node NCCL jobs
+    when the rank-to-GPU mapping is not what it guessed -- exactly the collectives
+    (barrier/broadcast) used by the rank0_sync model load path.
+    """
+    import torch
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        return
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        try:
+            dist.init_process_group(
+                backend="nccl",
+                device_id=torch.device(f"cuda:{local_rank}"),
+            )
+            return
+        except TypeError:
+            # Older torch without the device_id kwarg; set_device above still
+            # binds the process to the correct GPU.
+            dist.init_process_group(backend="nccl")
+            return
+
+    dist.init_process_group(backend="gloo")
+
+
 def _distributed_model_load_strategy() -> str:
     """How to load pretrained weights before FSDP/DDP wrapping.
 
@@ -520,6 +552,8 @@ def _run_qwen_finetune(
     model classes, so this preserves the recipe's input/output contract while
     using the Hugging Face model directly.
     """
+    import math
+
     import pandas as pd
     import torch
     import torch.distributed as dist
@@ -527,7 +561,7 @@ def _run_qwen_finetune(
     from torch.nn.parallel import DistributedDataParallel as DDP
     from torch.utils.data import DataLoader
     from torch.utils.data.distributed import DistributedSampler
-    from transformers import AutoModel, AutoTokenizer
+    from transformers import AutoModel, AutoTokenizer, get_scheduler
 
     model_name = _normalize_hf_model_name(cfg.base_model)
     final_model_dir = cfg.checkpoint_dir / "LATEST" / "model" / "consolidated"
@@ -538,15 +572,14 @@ def _run_qwen_finetune(
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     distributed = world_size > 1
 
-    if distributed and not dist.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend)
-
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         device = f"cuda:{local_rank}"
     else:
         device = "cpu"
+
+    if distributed and not dist.is_initialized():
+        _init_process_group_with_device(local_rank)
     is_rank0 = rank == 0
 
     with open(cfg.train_data_path, encoding="utf-8") as f:
@@ -588,24 +621,38 @@ def _run_qwen_finetune(
         print("Error: no usable training examples after resolving corpus documents.", file=sys.stderr)
         sys.exit(1)
 
-    dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+    # Compute in bf16, but keep optimizer master weights in fp32 under FSDP
+    # (FULL_SHARD splits the fp32 master across ranks). Stepping AdamW directly on
+    # bf16 weights at lr~1e-5 rounds the update to zero, so the loss never moves.
+    # Single GPU keeps bf16 (an 8B fp32 master will not fit one device).
+    use_fsdp = _should_use_fsdp(distributed, device)
+    compute_dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+    load_dtype = torch.float32 if (use_fsdp and device.startswith("cuda")) else compute_dtype
+    dtype = compute_dtype
     batch_size = max(1, min(cfg.local_batch_size, len(examples)))
     per_rank_examples = (len(examples) + world_size - 1) // world_size
     steps_per_epoch = max(1, (per_rank_examples + batch_size - 1) // batch_size)
     total_steps = steps_per_epoch * num_epochs
+
+    # Gradient accumulation so the *effective* batch matches global_batch_size
+    # instead of just local_batch_size * world_size.
+    micro_batch = batch_size * max(1, world_size)
+    grad_accum_steps = max(1, round(global_batch_size / micro_batch))
+    optim_steps_per_epoch = max(1, math.ceil(steps_per_epoch / grad_accum_steps))
+    optim_steps_total = optim_steps_per_epoch * num_epochs
 
     if is_rank0:
         print("Using Hugging Face Qwen fine-tune fallback")
         print(f"  Model:             {model_name}")
         print(f"  Distributed:       {distributed} (world_size={world_size})")
         print(f"  Device:            {device}")
+        print(f"  Master dtype:      {load_dtype} (compute {compute_dtype})")
         print(f"  Local batch size:  {batch_size}")
-        print(f"  Effective batch:   {batch_size * world_size}")
-        print(f"  Steps/epoch:       {steps_per_epoch}")
-        print(f"  Total steps:       {total_steps}")
+        print(f"  Grad accum steps:  {grad_accum_steps}")
+        print(f"  Effective batch:   {micro_batch * grad_accum_steps}")
+        print(f"  Optimizer steps:   {optim_steps_total}")
         print()
 
-    use_fsdp = _should_use_fsdp(distributed, device)
     tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
     model = _load_pretrained_for_distributed(
         model_name=model_name,
@@ -615,7 +662,7 @@ def _run_qwen_finetune(
         use_fsdp=use_fsdp,
         device=device,
         load_kwargs={
-            "torch_dtype": dtype,
+            "torch_dtype": load_dtype,
             "attn_implementation": cfg.attn_implementation or "sdpa",
             "low_cpu_mem_usage": True,
         },
@@ -639,6 +686,13 @@ def _run_qwen_finetune(
         train_model.parameters(),
         lr=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
+    )
+    # Apply the configured warmup + decay schedule (previously ignored here).
+    lr_scheduler = get_scheduler(
+        name=cfg.lr_decay_style,
+        optimizer=optimizer,
+        num_warmup_steps=cfg.lr_warmup_steps,
+        num_training_steps=optim_steps_total,
     )
 
     def last_token_pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -673,7 +727,7 @@ def _run_qwen_finetune(
             )
         return {"queries": queries, "passages": passages}
 
-    step = 0
+    optim_step = 0
     for epoch in range(num_epochs):
         sampler = DistributedSampler(
             examples,
@@ -691,8 +745,11 @@ def _run_qwen_finetune(
             sampler=sampler,
             collate_fn=collate,
         )
-        for batch in loader:
-            step += 1
+        optimizer.zero_grad(set_to_none=True)
+        accum_loss = torch.zeros((), device=device)
+        accum_count = 0
+        num_batches = len(loader)
+        for batch_idx, batch in enumerate(loader):
             query_embeddings = encode(batch["queries"], cfg.query_max_length)
             passage_embeddings = encode(batch["passages"], cfg.passage_max_length)
             passage_embeddings = passage_embeddings.view(
@@ -704,18 +761,28 @@ def _run_qwen_finetune(
             labels = torch.zeros(logits.shape[0], dtype=torch.long, device=device)
             loss = F.cross_entropy(logits, labels)
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            (loss / grad_accum_steps).backward()
+            accum_loss = accum_loss + loss.detach()
+            accum_count += 1
 
-            loss_for_log = loss.detach()
-            if distributed:
-                dist.all_reduce(loss_for_log, op=dist.ReduceOp.AVG)
-            if is_rank0:
-                print(
-                    f"epoch={epoch + 1}/{num_epochs} "
-                    f"step={step}/{total_steps} loss={loss_for_log.item():.4f}"
-                )
+            if accum_count == grad_accum_steps or (batch_idx + 1) == num_batches:
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                optim_step += 1
+
+                loss_for_log = accum_loss / accum_count
+                if distributed:
+                    dist.all_reduce(loss_for_log, op=dist.ReduceOp.AVG)
+                if is_rank0:
+                    print(
+                        f"epoch={epoch + 1}/{num_epochs} "
+                        f"step={optim_step}/{optim_steps_total} "
+                        f"loss={loss_for_log.item():.4f} "
+                        f"lr={lr_scheduler.get_last_lr()[0]:.2e}"
+                    )
+                accum_loss = torch.zeros((), device=device)
+                accum_count = 0
 
     if distributed:
         dist.barrier()
@@ -769,6 +836,8 @@ def _run_nv_embed_finetune(
     num_epochs: int,
 ) -> Path:
     """Fine-tune NV-Embed models with their remote-code latent pooling."""
+    import math
+
     import pandas as pd
     import torch
     import torch.distributed as dist
@@ -777,7 +846,7 @@ def _run_nv_embed_finetune(
     from torch.utils.data import DataLoader
     from torch.utils.data.distributed import DistributedSampler
     import transformers
-    from transformers import AutoModel
+    from transformers import AutoModel, get_scheduler
     from transformers.modeling_utils import PreTrainedModel
 
     model_name = _normalize_hf_model_name(cfg.base_model)
@@ -790,16 +859,15 @@ def _run_nv_embed_finetune(
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     distributed = world_size > 1
 
-    if distributed and not dist.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend)
-
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         torch.set_autocast_gpu_dtype(torch.bfloat16)
         device = f"cuda:{local_rank}"
     else:
         device = "cpu"
+
+    if distributed and not dist.is_initialized():
+        _init_process_group_with_device(local_rank)
     is_rank0 = rank == 0
 
     with open(cfg.train_data_path, encoding="utf-8") as f:
@@ -841,28 +909,45 @@ def _run_nv_embed_finetune(
         print("Error: no usable training examples after resolving corpus documents.", file=sys.stderr)
         sys.exit(1)
 
-    # Use bf16 on CUDA: fp16 produced NaNs, while fp32 plus AdamW states is too
-    # memory-heavy for DDP full-model training.
-    dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+    # Compute in bf16, but keep the optimizer master weights in fp32 whenever FSDP
+    # is active. FSDP FULL_SHARD splits the fp32 master across ranks, so the
+    # per-GPU cost stays small, while MixedPrecision(param_dtype=bf16) still runs
+    # the forward/backward in bf16. Previously the model was loaded in bf16 and the
+    # optimizer stepped on bf16 weights directly: at lr~1e-5 the AdamW update is
+    # smaller than bf16's representable gap, so it rounded to zero and the loss
+    # never moved. Single GPU keeps bf16 (a 7B fp32 master will not fit one device).
+    use_fsdp = _should_use_fsdp(distributed, device)
+    compute_dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+    load_dtype = torch.float32 if (use_fsdp and device.startswith("cuda")) else compute_dtype
+    dtype = compute_dtype
     batch_size = max(1, min(cfg.local_batch_size, len(examples)))
     per_rank_examples = (len(examples) + world_size - 1) // world_size
     steps_per_epoch = max(1, (per_rank_examples + batch_size - 1) // batch_size)
     total_steps = steps_per_epoch * num_epochs
+
+    # Gradient accumulation so the *effective* batch matches global_batch_size.
+    # Without this the optimizer stepped once per micro-batch (effective batch =
+    # local_batch_size * world_size), which is tiny and gives very noisy gradients
+    # that barely move the loss.
+    micro_batch = batch_size * max(1, world_size)
+    grad_accum_steps = max(1, round(global_batch_size / micro_batch))
+    optim_steps_per_epoch = max(1, math.ceil(steps_per_epoch / grad_accum_steps))
+    optim_steps_total = optim_steps_per_epoch * num_epochs
 
     if is_rank0:
         print("Using Hugging Face NV-Embed fine-tune fallback")
         print(f"  Model:             {model_name}")
         print(f"  Distributed:       {distributed} (world_size={world_size})")
         print(f"  Device:            {device}")
+        print(f"  Master dtype:      {load_dtype} (compute {compute_dtype})")
         print(f"  Local batch size:  {batch_size}")
-        print(f"  Effective batch:   {batch_size * world_size}")
-        print(f"  Steps/epoch:       {steps_per_epoch}")
-        print(f"  Total steps:       {total_steps}")
+        print(f"  Grad accum steps:  {grad_accum_steps}")
+        print(f"  Effective batch:   {micro_batch * grad_accum_steps}")
+        print(f"  Optimizer steps:   {optim_steps_total}")
         print()
 
     if not hasattr(PreTrainedModel, "all_tied_weights_keys"):
         PreTrainedModel.all_tied_weights_keys = {}
-    use_fsdp = _should_use_fsdp(distributed, device)
     model = _load_pretrained_for_distributed(
         model_name=model_name,
         rank=rank,
@@ -872,7 +957,7 @@ def _run_nv_embed_finetune(
         device=device,
         load_kwargs={
             "trust_remote_code": True,
-            "torch_dtype": dtype,
+            "torch_dtype": load_dtype,
             "low_cpu_mem_usage": True,
         },
         trust_remote_code=True,
@@ -902,6 +987,14 @@ def _run_nv_embed_finetune(
         lr=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
         foreach=False,
+    )
+    # Apply the configured warmup + decay schedule (previously ignored in this
+    # manual loop, so the LR stayed flat at the peak value with no warmup).
+    lr_scheduler = get_scheduler(
+        name=cfg.lr_decay_style,
+        optimizer=optimizer,
+        num_warmup_steps=cfg.lr_warmup_steps,
+        num_training_steps=optim_steps_total,
     )
 
     query_instruction = _nv_query_instruction(cfg.query_prefix)
@@ -938,7 +1031,7 @@ def _run_nv_embed_finetune(
             passages.extend(str(passage) for passage in item["passages"])  # type: ignore[index]
         return {"queries": queries, "passages": passages}
 
-    step = 0
+    optim_step = 0
     for epoch in range(num_epochs):
         sampler = DistributedSampler(
             examples,
@@ -956,8 +1049,11 @@ def _run_nv_embed_finetune(
             sampler=sampler,
             collate_fn=collate,
         )
-        for batch in loader:
-            step += 1
+        optimizer.zero_grad(set_to_none=True)
+        accum_loss = torch.zeros((), device=device)
+        accum_count = 0
+        num_batches = len(loader)
+        for batch_idx, batch in enumerate(loader):
             query_embeddings = encode(batch["queries"], query_instruction, cfg.query_max_length)
             passage_embeddings = encode(batch["passages"], passage_instruction, cfg.passage_max_length)
             passage_embeddings = passage_embeddings.view(
@@ -969,18 +1065,30 @@ def _run_nv_embed_finetune(
             labels = torch.zeros(logits.shape[0], dtype=torch.long, device=device)
             loss = F.cross_entropy(logits, labels)
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            # Scale by the accumulation factor so the summed gradient matches the
+            # average over the full effective batch.
+            (loss / grad_accum_steps).backward()
+            accum_loss = accum_loss + loss.detach()
+            accum_count += 1
 
-            loss_for_log = loss.detach()
-            if distributed:
-                dist.all_reduce(loss_for_log, op=dist.ReduceOp.AVG)
-            if is_rank0:
-                print(
-                    f"epoch={epoch + 1}/{num_epochs} "
-                    f"step={step}/{total_steps} loss={loss_for_log.item():.4f}"
-                )
+            if accum_count == grad_accum_steps or (batch_idx + 1) == num_batches:
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                optim_step += 1
+
+                loss_for_log = accum_loss / accum_count
+                if distributed:
+                    dist.all_reduce(loss_for_log, op=dist.ReduceOp.AVG)
+                if is_rank0:
+                    print(
+                        f"epoch={epoch + 1}/{num_epochs} "
+                        f"step={optim_step}/{optim_steps_total} "
+                        f"loss={loss_for_log.item():.4f} "
+                        f"lr={lr_scheduler.get_last_lr()[0]:.2e}"
+                    )
+                accum_loss = torch.zeros((), device=device)
+                accum_count = 0
 
     if distributed:
         dist.barrier()
