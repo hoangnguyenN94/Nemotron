@@ -518,6 +518,39 @@ def _prepare_model_for_save(train_model, model):
     return train_model, None
 
 
+def _save_hf_checkpoint(
+    *,
+    train_model,
+    model,
+    save_dir: "Path",
+    tokenizer=None,
+    distributed: bool,
+    is_rank0: bool,
+    label: str = "checkpoint",
+) -> None:
+    """Gather and write a Hugging Face checkpoint mid- or post-training.
+
+    The FSDP FULL_STATE_DICT gather inside ``_prepare_model_for_save`` is a
+    collective op, so this MUST be invoked on *every* rank; only rank 0 writes
+    files. A barrier keeps ranks aligned before training resumes.
+    """
+    import torch.distributed as dist
+
+    model_to_save, save_state_dict = _prepare_model_for_save(train_model, model)
+    if is_rank0:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\nSaving {label} to {save_dir}")
+        model_to_save.save_pretrained(
+            save_dir,
+            safe_serialization=True,
+            state_dict=save_state_dict,
+        )
+        if tokenizer is not None:
+            tokenizer.save_pretrained(save_dir)
+    if distributed:
+        dist.barrier()
+
+
 def _auto_scale_hyperparams(
     cfg: FinetuneConfig, num_examples: int
 ) -> tuple[int, int, int, int]:
@@ -569,6 +602,7 @@ def _run_qwen_finetune(
     num_examples: int,
     global_batch_size: int,
     num_epochs: int,
+    checkpoint_every_steps: int = 0,
 ) -> Path:
     """Fine-tune Qwen embedding models with a small local contrastive loop.
 
@@ -817,6 +851,26 @@ def _run_qwen_finetune(
                 accum_loss = torch.zeros((), device=device)
                 accum_count = 0
 
+                # Periodic checkpoint. The gather is collective, so all ranks
+                # must reach it on the same optim_step (they do: optim_step is
+                # driven by the rank-synchronized optimizer steps).
+                if (
+                    checkpoint_every_steps > 0
+                    and optim_step % checkpoint_every_steps == 0
+                    and optim_step < optim_steps_total
+                ):
+                    step_dir = cfg.checkpoint_dir / f"step_{optim_step}" / "model" / "consolidated"
+                    _save_hf_checkpoint(
+                        train_model=train_model,
+                        model=model,
+                        save_dir=step_dir,
+                        tokenizer=tokenizer,
+                        distributed=distributed,
+                        is_rank0=is_rank0,
+                        label=f"step-{optim_step} checkpoint",
+                    )
+                    model.train()
+
     if distributed:
         dist.barrier()
 
@@ -861,12 +915,13 @@ def _run_qwen_finetune(
     return final_model_dir
 
 
-def _run_nv_embed_finetune(
+def _run_nv_embed_finetune(  # noqa: C901
     cfg: FinetuneConfig,
     *,
     num_examples: int,
     global_batch_size: int,
     num_epochs: int,
+    checkpoint_every_steps: int = 0,
 ) -> Path:
     """Fine-tune NV-Embed models with their remote-code latent pooling."""
     import math
@@ -1130,6 +1185,26 @@ def _run_nv_embed_finetune(
                 accum_loss = torch.zeros((), device=device)
                 accum_count = 0
 
+                # Periodic checkpoint. The gather is collective, so all ranks
+                # must reach it on the same optim_step (they do: optim_step is
+                # driven by the rank-synchronized optimizer steps).
+                if (
+                    checkpoint_every_steps > 0
+                    and optim_step % checkpoint_every_steps == 0
+                    and optim_step < optim_steps_total
+                ):
+                    step_dir = cfg.checkpoint_dir / f"step_{optim_step}" / "model" / "consolidated"
+                    _save_hf_checkpoint(
+                        train_model=train_model,
+                        model=model,
+                        save_dir=step_dir,
+                        tokenizer=model.tokenizer,
+                        distributed=distributed,
+                        is_rank0=is_rank0,
+                        label=f"step-{optim_step} checkpoint",
+                    )
+                    model.train()
+
     if distributed:
         dist.barrier()
 
@@ -1240,6 +1315,7 @@ def run_finetune(cfg: FinetuneConfig) -> Path:
             num_examples=num_examples,
             global_batch_size=global_batch_size,
             num_epochs=num_epochs,
+            checkpoint_every_steps=ckpt_every,
         )
     if _is_nv_embed_model(cfg.base_model):
         return _run_nv_embed_finetune(
@@ -1247,6 +1323,7 @@ def run_finetune(cfg: FinetuneConfig) -> Path:
             num_examples=num_examples,
             global_batch_size=global_batch_size,
             num_epochs=num_epochs,
+            checkpoint_every_steps=ckpt_every,
         )
 
     # Import nemo-automodel components
