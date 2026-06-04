@@ -272,11 +272,22 @@ def _init_process_group_with_device(local_rank: int) -> None:
     when the rank-to-GPU mapping is not what it guessed -- exactly the collectives
     (barrier/broadcast) used by the rank0_sync model load path.
     """
+    import datetime
+
     import torch
     import torch.distributed as dist
 
     if dist.is_initialized():
         return
+
+    # Generous collective timeout. Default NCCL watchdog is ~10 min, but other
+    # ranks sit in a barrier while rank 0 streams and writes a multi-GB
+    # checkpoint to (possibly contended) shared storage during step/final saves;
+    # a short timeout would abort the whole multi-node job mid-save. Also covers
+    # the rank0_sync broadcast on slow loads. Tune via NEMOTRON_PG_TIMEOUT_MIN.
+    timeout = datetime.timedelta(
+        minutes=int(os.environ.get("NEMOTRON_PG_TIMEOUT_MIN", "30"))
+    )
 
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
@@ -284,15 +295,16 @@ def _init_process_group_with_device(local_rank: int) -> None:
             dist.init_process_group(
                 backend="nccl",
                 device_id=torch.device(f"cuda:{local_rank}"),
+                timeout=timeout,
             )
             return
         except TypeError:
             # Older torch without the device_id kwarg; set_device above still
             # binds the process to the correct GPU.
-            dist.init_process_group(backend="nccl")
+            dist.init_process_group(backend="nccl", timeout=timeout)
             return
 
-    dist.init_process_group(backend="gloo")
+    dist.init_process_group(backend="gloo", timeout=timeout)
 
 
 def _distributed_model_load_strategy() -> str:
@@ -497,7 +509,21 @@ def _wrap_train_model(
 
 
 def _prepare_model_for_save(train_model, model):
-    """Return the model object and optional full state dict for saving."""
+    """Return the model object and optional full state dict for saving.
+
+    Under FSDP the fp32 master is gathered with ``rank0_only=True``. Gathering it
+    straight into host RAM (``offload_to_cpu=True``) materializes the full fp32
+    model (~31GB for a 7-8B model) on rank 0 and SIGKILL-OOM'd memory-limited
+    pods during checkpointing. Instead we gather onto rank 0's GPU -- which has
+    headroom (it already holds the full fp32 model at load time) -- and then
+    stream each tensor to CPU in bf16, so host RAM peaks at ~16GB (the level that
+    already loads cleanly) and the saved weights are bf16 (standard for serving).
+
+    Set ``NEMOTRON_SAVE_OFFLOAD_CPU=1`` to force the legacy host-RAM gather (use
+    when the GPU is small but host RAM is plentiful).
+    """
+    import torch
+
     try:
         from torch.distributed.fsdp import (
             FullStateDictConfig,
@@ -508,9 +534,24 @@ def _prepare_model_for_save(train_model, model):
         FSDP = None  # type: ignore[assignment]
 
     if FSDP is not None and isinstance(train_model, FSDP):
-        full_state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        offload_cpu = os.environ.get("NEMOTRON_SAVE_OFFLOAD_CPU", "0").lower() in {"1", "true", "yes"}
+        full_state_cfg = FullStateDictConfig(offload_to_cpu=offload_cpu, rank0_only=True)
         with FSDP.state_dict_type(train_model, StateDictType.FULL_STATE_DICT, full_state_cfg):
-            state_dict = train_model.state_dict()
+            gathered = train_model.state_dict()
+
+        # With rank0_only=True only rank 0 receives the full tensors; other ranks
+        # get an empty dict. Stream the gathered (GPU) tensors to CPU in bf16 to
+        # cap host RAM, freeing each GPU tensor as we go.
+        if not gathered:
+            return model, gathered
+        state_dict = {}
+        for key in list(gathered.keys()):
+            tensor = gathered.pop(key)
+            if tensor.is_floating_point():
+                state_dict[key] = tensor.detach().to(device="cpu", dtype=torch.bfloat16)
+            else:
+                state_dict[key] = tensor.detach().to(device="cpu")
+            del tensor
         return model, state_dict
 
     if hasattr(train_model, "module"):
