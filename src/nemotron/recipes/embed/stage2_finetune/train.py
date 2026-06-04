@@ -509,21 +509,21 @@ def _wrap_train_model(
 
 
 def _prepare_model_for_save(train_model, model):
-    """Return the model object and optional full state dict for saving.
+    """Gather the FSDP full state dict (collective op -- call on ALL ranks).
 
-    Under FSDP the fp32 master is gathered with ``rank0_only=True``. Gathering it
-    straight into host RAM (``offload_to_cpu=True``) materializes the full fp32
-    model (~31GB for a 7-8B model) on rank 0 and SIGKILL-OOM'd memory-limited
-    pods during checkpointing. Instead we gather onto rank 0's GPU -- which has
-    headroom (it already holds the full fp32 model at load time) -- and then
-    stream each tensor to CPU in bf16, so host RAM peaks at ~16GB (the level that
-    already loads cleanly) and the saved weights are bf16 (standard for serving).
+    Returns ``(unwrapped_model, gathered_state_dict)``. Under FSDP the fp32
+    master is gathered with ``rank0_only=True`` so only rank 0 receives the
+    tensors (other ranks get an empty dict); ``gathered`` is ``None`` for the
+    non-FSDP (single-GPU / DDP) path. The tensors are gathered onto rank 0's
+    *GPU* (``offload_to_cpu=False``) -- not host RAM -- because the disk write is
+    streamed shard-by-shard by :func:`_write_sharded_checkpoint` to keep host RAM
+    bounded. Materializing the full model in host RAM (the old
+    ``offload_to_cpu=True`` path, or even a single full bf16 CPU copy) SIGKILL-
+    OOM'd memory-limited pods mid-checkpoint.
 
-    Set ``NEMOTRON_SAVE_OFFLOAD_CPU=1`` to force the legacy host-RAM gather (use
-    when the GPU is small but host RAM is plentiful).
+    Set ``NEMOTRON_SAVE_OFFLOAD_CPU=1`` to gather straight to host RAM instead
+    (only when the GPU is small but host RAM is plentiful).
     """
-    import torch
-
     try:
         from torch.distributed.fsdp import (
             FullStateDictConfig,
@@ -534,29 +534,114 @@ def _prepare_model_for_save(train_model, model):
         FSDP = None  # type: ignore[assignment]
 
     if FSDP is not None and isinstance(train_model, FSDP):
+        import torch
+
+        # Free cached blocks so the full-model all-gather has contiguous headroom
+        # on rank 0's GPU (it transiently holds the whole model on top of the
+        # sharded params + optimizer state).
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         offload_cpu = os.environ.get("NEMOTRON_SAVE_OFFLOAD_CPU", "0").lower() in {"1", "true", "yes"}
         full_state_cfg = FullStateDictConfig(offload_to_cpu=offload_cpu, rank0_only=True)
         with FSDP.state_dict_type(train_model, StateDictType.FULL_STATE_DICT, full_state_cfg):
             gathered = train_model.state_dict()
-
-        # With rank0_only=True only rank 0 receives the full tensors; other ranks
-        # get an empty dict. Stream the gathered (GPU) tensors to CPU in bf16 to
-        # cap host RAM, freeing each GPU tensor as we go.
-        if not gathered:
-            return model, gathered
-        state_dict = {}
-        for key in list(gathered.keys()):
-            tensor = gathered.pop(key)
-            if tensor.is_floating_point():
-                state_dict[key] = tensor.detach().to(device="cpu", dtype=torch.bfloat16)
-            else:
-                state_dict[key] = tensor.detach().to(device="cpu")
-            del tensor
-        return model, state_dict
+        return model, gathered
 
     if hasattr(train_model, "module"):
         return train_model.module, None
     return train_model, None
+
+
+def _write_sharded_checkpoint(unwrapped_model, gathered, save_dir, *, tokenizer=None) -> None:
+    """Write an HF checkpoint from a rank-0 full state dict with bounded host RAM.
+
+    Streams each tensor GPU -> CPU(bf16) -> disk, grouped into shards, freeing
+    every tensor as soon as it is written, so host RAM peaks at roughly one shard
+    (~a few GB) instead of the entire model (~16GB bf16 / ~31GB fp32). Config,
+    the trust_remote_code modeling files (auto_map), and the tokenizer are
+    written with the standard Hugging Face helpers so the result reloads via
+    ``AutoModel.from_pretrained``. Shard size is tunable via
+    ``NEMOTRON_SAVE_SHARD_GB`` (default 3GB).
+    """
+    import gc
+
+    import torch
+    from safetensors.torch import save_file
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # For trust_remote_code models (e.g. NV-Embed) copy the modeling .py files so
+    # the checkpoint reloads in an air-gapped environment. Standard models such
+    # as Qwen have no auto_map and need nothing extra.
+    if getattr(unwrapped_model.config, "auto_map", None):
+        try:
+            from transformers.dynamic_module_utils import custom_object_save
+
+            custom_object_save(unwrapped_model, str(save_dir), config=unwrapped_model.config)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"  WARNING: failed to copy remote modeling code into {save_dir}: {exc}. "
+                "The checkpoint may not reload offline without trust_remote_code source files.",
+                file=sys.stderr,
+            )
+    unwrapped_model.config.save_pretrained(str(save_dir))
+
+    shard_gb = float(os.environ.get("NEMOTRON_SAVE_SHARD_GB", "3"))
+    max_shard_bytes = max(1, int(shard_gb * (1024**3)))
+
+    def _saved_nbytes(t) -> int:
+        # Floats are written as bf16 (2 bytes); other dtypes keep their size.
+        return t.numel() * (2 if t.is_floating_point() else t.element_size())
+
+    # Group keys into shards by projected on-disk size.
+    shards: list[list[str]] = []
+    current: list[str] = []
+    current_bytes = 0
+    for key in list(gathered.keys()):
+        size = _saved_nbytes(gathered[key])
+        if current and current_bytes + size > max_shard_bytes:
+            shards.append(current)
+            current, current_bytes = [], 0
+        current.append(key)
+        current_bytes += size
+    if current:
+        shards.append(current)
+
+    num_shards = len(shards) or 1
+    weight_map: dict[str, str] = {}
+    total_size = 0
+    for index, shard_keys in enumerate(shards, start=1):
+        fname = (
+            "model.safetensors"
+            if num_shards == 1
+            else f"model-{index:05d}-of-{num_shards:05d}.safetensors"
+        )
+        tensors: dict[str, "torch.Tensor"] = {}
+        for key in shard_keys:
+            tensor = gathered.pop(key).detach()
+            if tensor.is_floating_point():
+                tensor = tensor.to(device="cpu", dtype=torch.bfloat16)
+            else:
+                tensor = tensor.to(device="cpu")
+            tensor = tensor.contiguous()
+            tensors[key] = tensor
+            total_size += tensor.numel() * tensor.element_size()
+            weight_map[key] = fname
+        save_file(tensors, str(save_dir / fname), metadata={"format": "pt"})
+        del tensors
+        gc.collect()
+
+    if num_shards > 1:
+        index_path = save_dir / "model.safetensors.index.json"
+        with open(index_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {"metadata": {"total_size": total_size}, "weight_map": weight_map},
+                f,
+                indent=2,
+            )
+
+    if tokenizer is not None:
+        tokenizer.save_pretrained(str(save_dir))
 
 
 def _save_hf_checkpoint(
@@ -577,17 +662,19 @@ def _save_hf_checkpoint(
     """
     import torch.distributed as dist
 
-    model_to_save, save_state_dict = _prepare_model_for_save(train_model, model)
+    unwrapped_model, gathered = _prepare_model_for_save(train_model, model)
     if is_rank0:
-        save_dir.mkdir(parents=True, exist_ok=True)
         print(f"\nSaving {label} to {save_dir}")
-        model_to_save.save_pretrained(
-            save_dir,
-            safe_serialization=True,
-            state_dict=save_state_dict,
-        )
-        if tokenizer is not None:
-            tokenizer.save_pretrained(save_dir)
+        if gathered is None:
+            # Non-FSDP (single GPU / DDP): params already live on one process.
+            save_dir.mkdir(parents=True, exist_ok=True)
+            unwrapped_model.save_pretrained(save_dir, safe_serialization=True)
+            if tokenizer is not None:
+                tokenizer.save_pretrained(str(save_dir))
+        else:
+            _write_sharded_checkpoint(
+                unwrapped_model, gathered, save_dir, tokenizer=tokenizer
+            )
     if distributed:
         dist.barrier()
 
@@ -915,15 +1002,16 @@ def _run_qwen_finetune(
     if distributed:
         dist.barrier()
 
-    model_to_save, save_state_dict = _prepare_model_for_save(train_model, model)
+    _save_hf_checkpoint(
+        train_model=train_model,
+        model=model,
+        save_dir=final_model_dir,
+        tokenizer=tokenizer,
+        distributed=distributed,
+        is_rank0=is_rank0,
+        label="Qwen fine-tuned model",
+    )
     if is_rank0:
-        print(f"\nSaving Qwen fine-tuned model to {final_model_dir}")
-        model_to_save.save_pretrained(
-            final_model_dir,
-            safe_serialization=True,
-            state_dict=save_state_dict,
-        )
-        tokenizer.save_pretrained(final_model_dir)
         metadata_path = cfg.checkpoint_dir / "LATEST" / "training_metadata.json"
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         with open(metadata_path, "w", encoding="utf-8") as f:
@@ -1249,15 +1337,16 @@ def _run_nv_embed_finetune(  # noqa: C901
     if distributed:
         dist.barrier()
 
-    model_to_save, save_state_dict = _prepare_model_for_save(train_model, model)
+    _save_hf_checkpoint(
+        train_model=train_model,
+        model=model,
+        save_dir=final_model_dir,
+        tokenizer=model.tokenizer,
+        distributed=distributed,
+        is_rank0=is_rank0,
+        label="NV-Embed fine-tuned model",
+    )
     if is_rank0:
-        print(f"\nSaving NV-Embed fine-tuned model to {final_model_dir}")
-        model_to_save.save_pretrained(
-            final_model_dir,
-            safe_serialization=True,
-            state_dict=save_state_dict,
-        )
-        model.tokenizer.save_pretrained(final_model_dir)
         metadata_path = cfg.checkpoint_dir / "LATEST" / "training_metadata.json"
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         with open(metadata_path, "w", encoding="utf-8") as f:
