@@ -319,8 +319,17 @@ def _load_pretrained_for_distributed(
     load_kwargs: dict,
     trust_remote_code: bool = False,
     is_rank0: bool = False,
+    master_dtype=None,
 ):
-    """Load a pretrained model without every rank duplicating checkpoint I/O."""
+    """Load a pretrained model without every rank duplicating checkpoint I/O.
+
+    ``master_dtype`` is the dtype the optimizer master weights should end up in
+    (typically fp32 under FSDP for stable updates). To avoid OOMing host RAM on
+    memory-limited pods, weights are *read* from disk in ``load_kwargs["torch_dtype"]``
+    (bf16) and only rank 0 upcasts to ``master_dtype`` -- and it does so directly
+    on the GPU, where memory is abundant, rather than holding a full fp32 copy in
+    CPU RAM (which previously SIGKILLed rank 0 at "Loading checkpoint shards").
+    """
     import gc
 
     import torch
@@ -338,11 +347,24 @@ def _load_pretrained_for_distributed(
 
     trc = bool(trust_remote_code or load_kwargs.get("trust_remote_code", False))
 
+    # Dtype used to build the empty (meta) shells on non-zero ranks. It must match
+    # rank 0's parameter dtype after any upcast, otherwise FSDP's
+    # sync_module_states broadcast hits a dtype mismatch.
+    meta_dtype = master_dtype or load_kwargs.get("torch_dtype")
+
     if use_rank0_sync:
         if is_rank0:
             print("  Model load:        rank0_sync (only rank 0 reads checkpoint shards; others build on meta)")
         if rank == 0:
             model = _load_full_model()
+            # Upcast on the GPU (not host RAM) so the optimizer gets fp32 master
+            # weights without a 2x host-RAM spike during loading.
+            if (
+                master_dtype is not None
+                and device.startswith("cuda")
+                and next(model.parameters()).dtype != master_dtype
+            ):
+                model = model.to(device=device, dtype=master_dtype)
         else:
             config = AutoConfig.from_pretrained(
                 model_name,
@@ -355,6 +377,7 @@ def _load_pretrained_for_distributed(
                 not in {
                     "low_cpu_mem_usage",
                     "trust_remote_code",
+                    "torch_dtype",
                 }
             }
             # Build the module structure on the meta device so non-zero ranks
@@ -366,6 +389,7 @@ def _load_pretrained_for_distributed(
                 model = AutoModel.from_config(
                     config,
                     trust_remote_code=trc,
+                    torch_dtype=meta_dtype,
                     **config_kwargs,
                 )
         dist.barrier()
@@ -621,13 +645,21 @@ def _run_qwen_finetune(
         print("Error: no usable training examples after resolving corpus documents.", file=sys.stderr)
         sys.exit(1)
 
-    # Compute in bf16, but keep optimizer master weights in fp32 under FSDP
-    # (FULL_SHARD splits the fp32 master across ranks). Stepping AdamW directly on
-    # bf16 weights at lr~1e-5 rounds the update to zero, so the loss never moves.
-    # Single GPU keeps bf16 (an 8B fp32 master will not fit one device).
+    # Compute in bf16 and keep optimizer master weights in fp32 under FSDP so
+    # AdamW updates at lr~1e-5 are not rounded away by bf16 (which stalled the
+    # loss). Weights are read from disk in bf16 to keep rank-0 host RAM low, and
+    # rank 0 upcasts to fp32 directly on the GPU; FSDP FULL_SHARD splits the fp32
+    # master across ranks. Set NEMOTRON_MASTER_DTYPE=bf16 to keep the legacy bf16
+    # master. Single GPU keeps bf16 (an 8B fp32 master will not fit one device).
     use_fsdp = _should_use_fsdp(distributed, device)
     compute_dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
-    load_dtype = torch.float32 if (use_fsdp and device.startswith("cuda")) else compute_dtype
+    load_dtype = compute_dtype
+    _want_fp32_master = os.environ.get("NEMOTRON_MASTER_DTYPE", "fp32").lower() in {"fp32", "float32"}
+    master_dtype = (
+        torch.float32
+        if (_want_fp32_master and use_fsdp and device.startswith("cuda"))
+        else compute_dtype
+    )
     dtype = compute_dtype
     batch_size = max(1, min(cfg.local_batch_size, len(examples)))
     per_rank_examples = (len(examples) + world_size - 1) // world_size
@@ -646,7 +678,7 @@ def _run_qwen_finetune(
         print(f"  Model:             {model_name}")
         print(f"  Distributed:       {distributed} (world_size={world_size})")
         print(f"  Device:            {device}")
-        print(f"  Master dtype:      {load_dtype} (compute {compute_dtype})")
+        print(f"  Master dtype:      {master_dtype} (compute {compute_dtype}, load {load_dtype})")
         print(f"  Local batch size:  {batch_size}")
         print(f"  Grad accum steps:  {grad_accum_steps}")
         print(f"  Effective batch:   {micro_batch * grad_accum_steps}")
@@ -667,6 +699,7 @@ def _run_qwen_finetune(
             "low_cpu_mem_usage": True,
         },
         is_rank0=is_rank0,
+        master_dtype=master_dtype,
     )
     if not (distributed and use_fsdp):
         model = model.to(device)
@@ -909,16 +942,22 @@ def _run_nv_embed_finetune(
         print("Error: no usable training examples after resolving corpus documents.", file=sys.stderr)
         sys.exit(1)
 
-    # Compute in bf16, but keep the optimizer master weights in fp32 whenever FSDP
-    # is active. FSDP FULL_SHARD splits the fp32 master across ranks, so the
-    # per-GPU cost stays small, while MixedPrecision(param_dtype=bf16) still runs
-    # the forward/backward in bf16. Previously the model was loaded in bf16 and the
-    # optimizer stepped on bf16 weights directly: at lr~1e-5 the AdamW update is
-    # smaller than bf16's representable gap, so it rounded to zero and the loss
-    # never moved. Single GPU keeps bf16 (a 7B fp32 master will not fit one device).
+    # Compute in bf16 and keep the optimizer master weights in fp32 under FSDP so
+    # AdamW updates at lr~1e-5 are not rounded away by bf16 (which stalled the
+    # loss). To avoid OOMing rank-0 host RAM, weights are *read* from disk in bf16
+    # (~16GB for a 7-8B model) and rank 0 upcasts to fp32 directly on the GPU;
+    # FSDP FULL_SHARD then splits the fp32 master across ranks. Set
+    # NEMOTRON_MASTER_DTYPE=bf16 to keep the legacy bf16 master (lower GPU peak,
+    # weaker convergence). Single GPU stays bf16 (a fp32 master will not fit one device).
     use_fsdp = _should_use_fsdp(distributed, device)
     compute_dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
-    load_dtype = torch.float32 if (use_fsdp and device.startswith("cuda")) else compute_dtype
+    load_dtype = compute_dtype
+    _want_fp32_master = os.environ.get("NEMOTRON_MASTER_DTYPE", "fp32").lower() in {"fp32", "float32"}
+    master_dtype = (
+        torch.float32
+        if (_want_fp32_master and use_fsdp and device.startswith("cuda"))
+        else compute_dtype
+    )
     dtype = compute_dtype
     batch_size = max(1, min(cfg.local_batch_size, len(examples)))
     per_rank_examples = (len(examples) + world_size - 1) // world_size
@@ -939,7 +978,7 @@ def _run_nv_embed_finetune(
         print(f"  Model:             {model_name}")
         print(f"  Distributed:       {distributed} (world_size={world_size})")
         print(f"  Device:            {device}")
-        print(f"  Master dtype:      {load_dtype} (compute {compute_dtype})")
+        print(f"  Master dtype:      {master_dtype} (compute {compute_dtype}, load {load_dtype})")
         print(f"  Local batch size:  {batch_size}")
         print(f"  Grad accum steps:  {grad_accum_steps}")
         print(f"  Effective batch:   {micro_batch * grad_accum_steps}")
@@ -962,6 +1001,7 @@ def _run_nv_embed_finetune(
         },
         trust_remote_code=True,
         is_rank0=is_rank0,
+        master_dtype=master_dtype,
     )
     if not (distributed and use_fsdp):
         model = model.to(device)
