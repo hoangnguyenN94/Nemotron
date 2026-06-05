@@ -644,6 +644,67 @@ def _write_sharded_checkpoint(unwrapped_model, gathered, save_dir, *, tokenizer=
         tokenizer.save_pretrained(str(save_dir))
 
 
+def _copy_aux_model_files(base_model_name, save_dir) -> None:
+    """Copy non-weight auxiliary files from the base model into the checkpoint.
+
+    ``save_pretrained`` only writes config.json + weights + tokenizer, but
+    sentence-transformers style models (NV-Embed-v2) ship extra files that the
+    serving/eval stack relies on -- notably ``sentence_bert_config.json`` (holds
+    ``max_seq_length``), ``config_sentence_transformers.json``, ``modules.json``
+    and ``1_Pooling/``. Without them inference loses the sequence length (causing
+    the "no maximum length is provided ... Default to no truncation" warning) and
+    the pooling pipeline, so embeddings no longer match the base model. We copy
+    every base file we did not already write, skipping the (large) weight shards
+    since we serialize our own bf16 weights.
+    """
+    import shutil
+
+    base_dir = None
+    candidate = Path(base_model_name)
+    if candidate.is_dir():
+        base_dir = candidate
+    else:
+        try:
+            from huggingface_hub import snapshot_download
+
+            base_dir = Path(snapshot_download(base_model_name, local_files_only=True))
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"  WARNING: could not locate base model files for {base_model_name} "
+                f"to copy auxiliary configs ({exc}). The checkpoint may miss "
+                "sentence_bert_config.json / pooling config.",
+                file=sys.stderr,
+            )
+            return
+
+    if base_dir is None or not base_dir.is_dir():
+        return
+
+    weight_suffixes = {".safetensors", ".bin", ".pt", ".pth", ".h5", ".msgpack", ".ckpt"}
+    skip_names = {"model.safetensors.index.json", "pytorch_model.bin.index.json"}
+    copied = []
+    for src in base_dir.rglob("*"):
+        if not src.is_file():
+            continue
+        rel = src.relative_to(base_dir)
+        if any(part in {".cache", ".git", "__pycache__"} for part in rel.parts):
+            continue
+        if src.suffix in weight_suffixes or src.name in skip_names:
+            continue
+        dst = save_dir / rel
+        if dst.exists():
+            # Don't clobber what we just wrote (config.json, tokenizer, code).
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(src, dst)
+            copied.append(str(rel))
+        except Exception as exc:  # noqa: BLE001
+            print(f"  WARNING: failed to copy {rel} into checkpoint: {exc}", file=sys.stderr)
+    if copied:
+        print(f"  Copied {len(copied)} auxiliary base-model file(s): {', '.join(sorted(copied))}")
+
+
 def _save_hf_checkpoint(
     *,
     train_model,
@@ -653,6 +714,7 @@ def _save_hf_checkpoint(
     distributed: bool,
     is_rank0: bool,
     label: str = "checkpoint",
+    base_model_name: str | None = None,
 ) -> None:
     """Gather and write a Hugging Face checkpoint mid- or post-training.
 
@@ -675,6 +737,10 @@ def _save_hf_checkpoint(
             _write_sharded_checkpoint(
                 unwrapped_model, gathered, save_dir, tokenizer=tokenizer
             )
+        # Restore sentence-transformers / pooling / tokenizer extras the HF save
+        # helpers omit, so the checkpoint reloads exactly like the base model.
+        if base_model_name:
+            _copy_aux_model_files(base_model_name, save_dir)
     if distributed:
         dist.barrier()
 
@@ -996,6 +1062,7 @@ def _run_qwen_finetune(
                         distributed=distributed,
                         is_rank0=is_rank0,
                         label=f"step-{optim_step} checkpoint",
+                        base_model_name=model_name,
                     )
                     model.train()
 
@@ -1010,6 +1077,7 @@ def _run_qwen_finetune(
         distributed=distributed,
         is_rank0=is_rank0,
         label="Qwen fine-tuned model",
+        base_model_name=model_name,
     )
     if is_rank0:
         metadata_path = cfg.checkpoint_dir / "LATEST" / "training_metadata.json"
@@ -1331,6 +1399,7 @@ def _run_nv_embed_finetune(  # noqa: C901
                         distributed=distributed,
                         is_rank0=is_rank0,
                         label=f"step-{optim_step} checkpoint",
+                        base_model_name=model_name,
                     )
                     model.train()
 
@@ -1345,6 +1414,7 @@ def _run_nv_embed_finetune(  # noqa: C901
         distributed=distributed,
         is_rank0=is_rank0,
         label="NV-Embed fine-tuned model",
+        base_model_name=model_name,
     )
     if is_rank0:
         metadata_path = cfg.checkpoint_dir / "LATEST" / "training_metadata.json"
