@@ -89,6 +89,7 @@ class FinetuneConfig(RecipeSettings):
     lr_warmup_steps: int = Field(default=1, ge=0, description="Learning rate warmup steps.")
     lr_decay_style: Literal["cosine", "linear"] = Field(default="cosine", description="LR decay schedule (cosine, linear).")
     weight_decay: float = Field(default=0.01, ge=0, description="Weight decay for optimizer.")
+    max_grad_norm: float = Field(default=1.0, gt=0, description="Max gradient norm for clipping (guards against NaN-loss spikes).")
 
     # Model architecture
     attn_implementation: Literal["sdpa", "flash_attention_2", "eager"] | None = Field(default=None, description="Attention implementation (sdpa, flash_attention_2, eager). None auto-detects.")
@@ -452,9 +453,23 @@ def _wrap_train_model(
 
         mixed_precision = None
         if device.startswith("cuda"):
+            # Reduce gradients in fp32 by default. Under multi-node FSDP the
+            # gradient reduce-scatter/all-reduce runs across many shards (and over
+            # the inter-node fabric); doing it in bf16 loses precision and, with a
+            # large logit scale (small temperature), can overflow to inf -- which
+            # then poisons the fp32 master weights and produces a permanent NaN
+            # loss after the first couple of optimizer steps. fp32 reduction keeps
+            # the collective numerically stable while compute stays in bf16. Set
+            # NEMOTRON_FSDP_REDUCE_DTYPE=bf16 to restore the legacy behaviour.
+            reduce_dtype = (
+                torch.float32
+                if os.environ.get("NEMOTRON_FSDP_REDUCE_DTYPE", "fp32").lower()
+                in {"fp32", "float32"}
+                else dtype
+            )
             mixed_precision = MixedPrecision(
                 param_dtype=dtype,
-                reduce_dtype=dtype,
+                reduce_dtype=reduce_dtype,
                 buffer_dtype=dtype,
             )
 
@@ -955,6 +970,7 @@ def _run_qwen_finetune(
         num_warmup_steps=cfg.lr_warmup_steps,
         num_training_steps=optim_steps_total,
     )
+    max_grad_norm = cfg.max_grad_norm
 
     def last_token_pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         left_padding = attention_mask[:, -1].sum() == attention_mask.shape[0]
@@ -1027,6 +1043,33 @@ def _run_qwen_finetune(
             accum_count += 1
 
             if accum_count == grad_accum_steps or (batch_idx + 1) == num_batches:
+                # Clip gradients before stepping. With a small temperature the
+                # contrastive logits are scaled by 1/temperature, so the gradient
+                # can spike on an unlucky batch; without clipping a single large
+                # gradient writes inf/NaN into the weights and the loss is NaN for
+                # the rest of training. Use FSDP's clip_grad_norm_ when wrapped so
+                # the norm is computed across all shards/ranks.
+                if hasattr(train_model, "clip_grad_norm_"):
+                    grad_norm = train_model.clip_grad_norm_(max_grad_norm)
+                else:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        train_model.parameters(), max_grad_norm
+                    )
+
+                # Skip the update if the gradient is non-finite so one bad batch
+                # cannot permanently corrupt the master weights.
+                if not torch.isfinite(grad_norm):
+                    if is_rank0:
+                        print(
+                            f"WARNING: skipping optim_step (non-finite grad_norm="
+                            f"{grad_norm}) at epoch={epoch + 1} batch={batch_idx}",
+                            file=sys.stderr,
+                        )
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_loss = torch.zeros((), device=device)
+                    accum_count = 0
+                    continue
+
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -1040,7 +1083,8 @@ def _run_qwen_finetune(
                         f"epoch={epoch + 1}/{num_epochs} "
                         f"step={optim_step}/{optim_steps_total} "
                         f"loss={loss_for_log.item():.4f} "
-                        f"lr={lr_scheduler.get_last_lr()[0]:.2e}"
+                        f"lr={lr_scheduler.get_last_lr()[0]:.2e} "
+                        f"grad_norm={float(grad_norm):.2f}"
                     )
                 accum_loss = torch.zeros((), device=device)
                 accum_count = 0
@@ -1288,6 +1332,7 @@ def _run_nv_embed_finetune(  # noqa: C901
         num_warmup_steps=cfg.lr_warmup_steps,
         num_training_steps=optim_steps_total,
     )
+    max_grad_norm = cfg.max_grad_norm
 
     query_instruction = _nv_query_instruction(cfg.query_prefix)
     passage_instruction = "" if cfg.passage_prefix == "passage:" else cfg.passage_prefix
@@ -1364,6 +1409,33 @@ def _run_nv_embed_finetune(  # noqa: C901
             accum_count += 1
 
             if accum_count == grad_accum_steps or (batch_idx + 1) == num_batches:
+                # Clip gradients before stepping. With a small temperature the
+                # contrastive logits are scaled by 1/temperature, so the gradient
+                # can spike on an unlucky batch; without clipping a single large
+                # gradient writes inf/NaN into the weights and the loss is NaN for
+                # the rest of training. Use FSDP's clip_grad_norm_ when wrapped so
+                # the norm is computed across all shards/ranks.
+                if hasattr(train_model, "clip_grad_norm_"):
+                    grad_norm = train_model.clip_grad_norm_(max_grad_norm)
+                else:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        train_model.parameters(), max_grad_norm
+                    )
+
+                # Skip the update if the gradient is non-finite so one bad batch
+                # cannot permanently corrupt the master weights.
+                if not torch.isfinite(grad_norm):
+                    if is_rank0:
+                        print(
+                            f"WARNING: skipping optim_step (non-finite grad_norm="
+                            f"{grad_norm}) at epoch={epoch + 1} batch={batch_idx}",
+                            file=sys.stderr,
+                        )
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_loss = torch.zeros((), device=device)
+                    accum_count = 0
+                    continue
+
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -1377,7 +1449,8 @@ def _run_nv_embed_finetune(  # noqa: C901
                         f"epoch={epoch + 1}/{num_epochs} "
                         f"step={optim_step}/{optim_steps_total} "
                         f"loss={loss_for_log.item():.4f} "
-                        f"lr={lr_scheduler.get_last_lr()[0]:.2e}"
+                        f"lr={lr_scheduler.get_last_lr()[0]:.2e} "
+                        f"grad_norm={float(grad_norm):.2f}"
                     )
                 accum_loss = torch.zeros((), device=device)
                 accum_count = 0
