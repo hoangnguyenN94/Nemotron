@@ -97,6 +97,7 @@ class FinetuneConfig(RecipeSettings):
     pooling: Literal["avg", "cls", "last"] = Field(default="avg", description="Pooling strategy for embeddings.")
     l2_normalize: bool = Field(default=True, description="Whether to L2 normalize embeddings.")
     temperature: float = Field(default=0.02, gt=0, description="Temperature for contrastive loss.")
+    in_batch_negatives: bool = Field(default=True, description="Score each query against every passage in the (cross-GPU) global batch, not just its own hard negatives. Gathers embeddings across all GPUs/nodes so multi-node genuinely enlarges the negative pool. False restores per-query hard-negative-only loss.")
 
     # Tokenization
     query_max_length: int = Field(default=512, gt=0, description="Maximum query sequence length.")
@@ -262,6 +263,105 @@ def _enable_gradient_checkpointing(module, *, use_fsdp: bool) -> None:
             # Older transformers signatures without gradient_checkpointing_kwargs.
             pass
     module.gradient_checkpointing_enable()
+
+
+_GATHER_FN = None
+
+
+def _gather_embeddings_with_grad(tensor):
+    """All-gather embeddings across ranks while preserving gradients.
+
+    ``torch.distributed.all_gather`` is not differentiable: gradients do not flow
+    back to the per-rank inputs. For cross-GPU in-batch negatives we need each
+    rank's local embeddings to receive gradient from every query on every rank,
+    so we wrap the collective in a custom autograd Function whose backward
+    all-reduces (sums) the gathered gradient and returns this rank's slice.
+
+    Every rank computes the *same* global loss, so the summed gradient is
+    world_size larger than the local contribution; this cancels exactly with the
+    averaging (divide-by-world_size) that FSDP/DDP applies to parameter
+    gradients, yielding the correct full-batch gradient.
+    """
+    import torch
+    import torch.distributed as dist
+
+    global _GATHER_FN
+    if _GATHER_FN is None:
+
+        class _GatherWithGrad(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, inp):
+                world_size = dist.get_world_size()
+                gathered = [torch.empty_like(inp) for _ in range(world_size)]
+                dist.all_gather(gathered, inp.contiguous())
+                ctx.local_rows = inp.shape[0]
+                ctx.rank = dist.get_rank()
+                return torch.cat(gathered, dim=0)
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                grad = grad_output.contiguous()
+                dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+                start = ctx.rank * ctx.local_rows
+                return grad[start : start + ctx.local_rows]
+
+        _GATHER_FN = _GatherWithGrad
+
+    return _GATHER_FN.apply(tensor)
+
+
+def _contrastive_loss(
+    query_emb,
+    passage_emb,
+    *,
+    train_n_passages: int,
+    temperature: float,
+    distributed: bool,
+    in_batch_negatives: bool,
+):
+    """Contrastive cross-entropy loss for one micro-batch.
+
+    Layout: ``query_emb`` is ``[B, d]`` and ``passage_emb`` is ``[B * p, d]``
+    ordered so query ``k`` owns passages ``[k*p : (k+1)*p]`` with its positive at
+    offset 0 (followed by ``p-1`` hard negatives).
+
+    With ``in_batch_negatives`` every query is scored against *all* passages in
+    the batch (its own positive + everyone else's passages as extra negatives).
+    Under distributed training the query/passage embeddings are first gathered
+    across all ranks, so on N=world_size*B queries the negative pool per query is
+    ``N*p - 1`` instead of just ``p-1`` -- this is what makes multi-node enlarge
+    the contrastive signal rather than only the data-parallel throughput.
+
+    With ``in_batch_negatives=False`` it falls back to the legacy per-query loss
+    (each query only sees its own ``p`` passages).
+    """
+    import torch
+    import torch.distributed as dist
+    import torch.nn.functional as F
+
+    p = train_n_passages
+
+    if in_batch_negatives:
+        if distributed and dist.is_initialized() and dist.get_world_size() > 1:
+            query_emb = _gather_embeddings_with_grad(query_emb)
+            passage_emb = _gather_embeddings_with_grad(passage_emb)
+        # Score (and build logits) in fp32: with a large cross-GPU negative pool
+        # and small temperature the bf16 matmul can lose precision or overflow.
+        # The matrices here are tiny ([N, d] x [d, N*p]) so the upcast is cheap.
+        query_emb = query_emb.float()
+        passage_emb = passage_emb.float()
+        # [N, N*p]: every query vs every passage in the global batch.
+        logits = (query_emb @ passage_emb.t()) / temperature
+        # Query i's positive sits at global passage index i*p (rank-major,
+        # query-major, passage-major ordering is preserved by all_gather).
+        labels = torch.arange(query_emb.shape[0], device=query_emb.device) * p
+        return F.cross_entropy(logits, labels)
+
+    batch = query_emb.shape[0]
+    passage_emb = passage_emb.view(batch, p, -1)
+    logits = torch.einsum("bd,bpd->bp", query_emb.float(), passage_emb.float()) / temperature
+    labels = torch.zeros(batch, dtype=torch.long, device=query_emb.device)
+    return F.cross_entropy(logits, labels)
 
 
 def _init_process_group_with_device(local_rank: int) -> None:
@@ -1029,14 +1129,14 @@ def _run_qwen_finetune(
         for batch_idx, batch in enumerate(loader):
             query_embeddings = encode(batch["queries"], cfg.query_max_length)
             passage_embeddings = encode(batch["passages"], cfg.passage_max_length)
-            passage_embeddings = passage_embeddings.view(
-                len(batch["queries"]),
-                cfg.train_n_passages,
-                -1,
+            loss = _contrastive_loss(
+                query_embeddings,
+                passage_embeddings,
+                train_n_passages=cfg.train_n_passages,
+                temperature=cfg.temperature,
+                distributed=distributed,
+                in_batch_negatives=cfg.in_batch_negatives,
             )
-            logits = torch.einsum("bd,bpd->bp", query_embeddings, passage_embeddings) / cfg.temperature
-            labels = torch.zeros(logits.shape[0], dtype=torch.long, device=device)
-            loss = F.cross_entropy(logits, labels)
 
             (loss / grad_accum_steps).backward()
             accum_loss = accum_loss + loss.detach()
@@ -1393,14 +1493,14 @@ def _run_nv_embed_finetune(  # noqa: C901
         for batch_idx, batch in enumerate(loader):
             query_embeddings = encode(batch["queries"], query_instruction, cfg.query_max_length)
             passage_embeddings = encode(batch["passages"], passage_instruction, cfg.passage_max_length)
-            passage_embeddings = passage_embeddings.view(
-                len(batch["queries"]),
-                cfg.train_n_passages,
-                -1,
+            loss = _contrastive_loss(
+                query_embeddings,
+                passage_embeddings,
+                train_n_passages=cfg.train_n_passages,
+                temperature=cfg.temperature,
+                distributed=distributed,
+                in_batch_negatives=cfg.in_batch_negatives,
             )
-            logits = torch.einsum("bd,bpd->bp", query_embeddings, passage_embeddings) / cfg.temperature
-            labels = torch.zeros(logits.shape[0], dtype=torch.long, device=device)
-            loss = F.cross_entropy(logits, labels)
 
             # Scale by the accumulation factor so the summed gradient matches the
             # average over the full effective batch.
