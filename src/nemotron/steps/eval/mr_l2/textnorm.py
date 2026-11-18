@@ -26,6 +26,13 @@ _VI_DIACRITICS = set(
     "ÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬÈÉẺẼẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴĐ"
 )
 
+# Marks that are not also routine French/Spanish/Portuguese accents. Used as a
+# *word-level* Vietnamese vote, never as a whole-sentence short-circuit.
+_VI_DISTINCTIVE_DIACRITICS = set(
+    "ăằắẳẵặơờớởỡợưừứửữựđảạẻẹẽỉịỏọủụỷỵỹĩũầấẩẫậềếểễệồốổỗộỳ"
+    "ĂẰẮẲẴẶƠỜỚỞỠỢƯỪỨỬỮỰĐẢẠẺẸẼỈỊỎỌỦỤỶỴỸĨŨẦẤẨẪẬỀẾỂỄỆỒỐỔỖỘỲ"
+)
+
 _VI_CHAR_MAP = str.maketrans(
     {
         "à": "a",
@@ -111,6 +118,11 @@ def has_vietnamese_diacritics(text: str) -> bool:
     return any(ch in _VI_DIACRITICS for ch in nfc(text))
 
 
+def has_distinctive_vietnamese_diacritics(text: str) -> bool:
+    """True for horn/breve/stroke/hook/dot or circumflex+tone, not é/à/ô alone."""
+    return any(ch in _VI_DISTINCTIVE_DIACRITICS for ch in nfc(text))
+
+
 def has_devanagari(text: str) -> bool:
     return any("\u0900" <= ch <= "\u097f" for ch in text or "")
 
@@ -120,9 +132,19 @@ def strip_vietnamese_diacritics(text: str) -> str:
     return unicodedata.normalize("NFC", folded)
 
 
+def fold_marks(text: str) -> str:
+    """Strip combining marks (NFKD). Language-agnostic; not a Vietnamese map."""
+    s = unicodedata.normalize("NFKD", text or "")
+    return "".join(ch for ch in s if not unicodedata.combining(ch))
+
+
+def has_non_ascii_letter(text: str) -> bool:
+    return any(ch.isalpha() and not ch.isascii() for ch in text or "")
+
+
 def normalize_for_copy(text: str) -> str:
     """Case/whitespace/punct fold used only to detect copied question text."""
-    s = strip_vietnamese_diacritics(collapse_ws(text)).lower()
+    s = fold_marks(collapse_ws(text)).casefold()
     s = _PUNCT.sub(" ", s)
     return collapse_ws(s)
 
@@ -146,6 +168,6 @@ def is_numeric_or_symbol(text: str) -> bool:
     if not s:
         return True
     for ch in s:
-        if ch.isalpha() or ch in _VI_DIACRITICS:
+        if ch.isalpha():
             return False
     return True

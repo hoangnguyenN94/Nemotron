@@ -66,3 +66,11 @@ uv run nemotron steps run eval/mr_l2 -c default \
   training.
 - Lone MCQ letters and numeric/LaTeX answers skip answer-language LID.
 - Unaccented Vietnamese still counts as Vietnamese.
+- The scorer is language-agnostic: identity comes only from a pluggable
+  detector vs `thinking_language_target`. Default cascade is Unicode script
+  then a Latin adapter (Vietnamese không-dấu vs English). FastText/GlotLID
+  plug in with no per-language overrides in the formula.
+- Detector `None` plus alphabetic mass is unidentified (not an ISO code).
+  Out of the denominator when any remainder was identified; if nothing was
+  identified, share is 0. Maths/code/option recap stay allowed. Empty
+  thinking fails the hard gate; maths-only does not.

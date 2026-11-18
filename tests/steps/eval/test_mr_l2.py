@@ -20,7 +20,12 @@ import json
 from pathlib import Path
 
 from nemotron.steps.eval.mr_l2.analyze import classify_thinking
-from nemotron.steps.eval.mr_l2.lid import detect_answer_language, score_thinking_language
+from nemotron.steps.eval.mr_l2.lid import (
+    HeuristicDetector,
+    detect_answer_language,
+    score_thinking_language,
+    thinking_lang_ok_for_gate,
+)
 from nemotron.steps.eval.mr_l2.runtime import run_mr_l2
 from nemotron.steps.eval.mr_l2.textnorm import is_numeric_or_symbol
 
@@ -95,6 +100,74 @@ def test_empty_answer_is_not_exempt() -> None:
     lang, ok = detect_answer_language("", "vi", task="mcq_aj")
     assert lang == "empty"
     assert not ok
+
+
+def test_empty_thinking_fails_gate_math_only_does_not() -> None:
+    empty = score_thinking_language("", "vi")
+    assert empty.in_language_95
+    assert empty.n_scored == 0
+    assert not thinking_lang_ok_for_gate(empty)
+    maths = score_thinking_language("16 - 3 = 13", "vi")
+    assert maths.in_language_95
+    assert maths.n_scored == 0
+    assert thinking_lang_ok_for_gate(maths)
+
+
+def test_quoted_english_cot_is_scored() -> None:
+    score = score_thinking_language(
+        '"She starts with sixteen eggs and then eats three of them so thirteen remain."',
+        "vi",
+    )
+    assert score.n_scored >= 1
+    assert not score.in_language_95
+
+
+def test_scorer_follows_any_detector() -> None:
+    class _Const:
+        def detect(self, text: str) -> str | None:
+            return "xx"
+
+    score = score_thinking_language("Cô ấy còn mười ba quả trứng.", "vi", detector=_Const())
+    assert score.languages == ("xx",)
+    assert not score.in_language_95
+    thai = score_thinking_language("นี่คือกระบวนการคิดในการแก้ปัญหาครั้งนี้", "th")
+    assert thai.in_language_95
+
+
+def test_unidentified_latin_does_not_poison_or_invent_und() -> None:
+    mixed = score_thinking_language(
+        ("Cô ấy trừ 3 quả trứng và còn 13 quả. " * 8)
+        + "Recall typical generator rotating magnetic field.",
+        "vi",
+    )
+    assert mixed.in_language_95
+    assert "und" not in mixed.languages
+    lone = score_thinking_language(
+        "Recall typical operation three-phase generator produces rotating magnetic field.",
+        "vi",
+    )
+    assert not lone.in_language_95
+    assert "und" not in lone.languages
+    from nemotron.steps.eval.mr_l2.strip import is_code_remainder
+
+    sent = "If he was able to finish his assignment in 2 hours, how many minutes remain?"
+    assert not is_code_remainder(sent)
+    if_score = score_thinking_language(sent, "vi")
+    assert if_score.n_scored >= 1
+    assert not if_score.in_language_95
+
+
+def test_cjk_and_romance_are_not_vietnamese() -> None:
+    zh = score_thinking_language("她有十六个鸡蛋，吃了三个，还剩十三个。", "vi")
+    ru = score_thinking_language("Она вычитает три яйца и получает тринадцать.", "vi")
+    fr = score_thinking_language("Résultat: elle soustrait trois oeufs et il reste treize.", "vi")
+    es = score_thinking_language("Hay dieciseis huevos en la cesta y ella come tres.", "vi")
+    assert zh.n_scored >= 1 and not zh.in_language_95
+    assert ru.n_scored >= 1 and not ru.in_language_95
+    assert not fr.in_language_95
+    assert not es.in_language_95
+    det = HeuristicDetector()
+    assert det.detect("She has 16 eggs and eats 3 so there are 13 left không.") == "en"
 
 
 def test_analyze_labels_english_cot() -> None:

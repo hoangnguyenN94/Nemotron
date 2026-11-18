@@ -28,6 +28,10 @@ def hard_gate(
     Language fail always −1. Correctness and closure only distinguish 1 vs 0
     after both language conditions pass.
 
+    thinking_lang_ok is L2 vs a pluggable detector (any target language).
+    Completely empty thinking fails; maths/code remainders are language-neutral.
+    Answer-language is the answer span only.
+
     Unlabeled items (<6/8) must be excluded by the caller, not scored 0.
     """
     if not thinking_lang_ok or not answer_lang_ok:
