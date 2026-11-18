@@ -25,7 +25,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from nemotron.steps.eval.mr_l2.lid import HeuristicDetector, _substantial_latin_prose, _word_weight
+from nemotron.steps.eval.mr_l2.lid import _has_letter_mass, _word_weight, default_detector
 from nemotron.steps.eval.mr_l2.strip import (
     _copied_from_question,
     _is_identifier_formula,
@@ -36,7 +36,7 @@ from nemotron.steps.eval.mr_l2.strip import (
 )
 from nemotron.steps.eval.mr_l2.textnorm import collapse_ws, is_numeric_or_symbol, normalize_for_copy
 
-_DET = HeuristicDetector()
+_DET = default_detector()
 
 REASON_ORDER = (
     "option_recap",
@@ -80,7 +80,7 @@ def classify_remainder(remainder: str, question_norm: str, *, target: str = "vi"
     copied = bool(question_norm and _copied_from_question(text, question_norm))
     lang = _DET.detect(text)
     if lang is None:
-        kind = "und_latin" if _substantial_latin_prose(text) else "none_allowed"
+        kind = "und_latin" if _has_letter_mass(text) else "none_allowed"
         return "copied" if copied else kind
     if lang == target:
         return "copied" if copied else "vi"

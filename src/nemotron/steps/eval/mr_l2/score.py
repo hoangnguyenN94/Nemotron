@@ -25,7 +25,12 @@ from nemotron.steps.eval.mr_l2.constants import (
     TOKEN_BUDGET,
 )
 from nemotron.steps.eval.mr_l2.hard_gate import hard_gate
-from nemotron.steps.eval.mr_l2.lid import LanguageDetector, detect_answer_language, score_thinking_language
+from nemotron.steps.eval.mr_l2.lid import (
+    LanguageDetector,
+    detect_answer_language,
+    score_thinking_language,
+    thinking_lang_ok_for_gate,
+)
 from nemotron.steps.eval.mr_l2.parser import answers_match, parse_answer, parse_mgsm_prefix, split_think_answer
 from nemotron.steps.eval.mr_l2.types import PathKind, ScoreResult, TaskKind
 
@@ -59,14 +64,20 @@ def score_trace(
 
     split = split_think_answer(raw)
     closure = check_closure(split, n_tokens=n_tokens, budget=max_tokens or TOKEN_BUDGET)
-    parsed = parse_answer(split.answer_span, task, raw=raw, options=options, extract=extract)
+    parsed = parse_answer(
+        split.answer_span,
+        task,
+        raw=raw if path == "eval" else "",
+        options=options,
+        extract=extract,
+    )
     parser_answer = ""
     parser_correct: bool | None = None
     if task == "numeric":
         prefix = answer_prefix or MGSM_VI_ANSWER_PREFIX
         parser_answer = parse_mgsm_prefix(split.answer_span, prefix)
-        # A finished generation that wrote the final "#### N" inside the think block.
-        if not parsed and not split.answer_span and not closure.truncated:
+        # Eval-only: a finished generation that wrote the final "#### N" inside think.
+        if path == "eval" and not parsed and not split.answer_span and not closure.truncated:
             parsed = parse_mgsm_prefix(split.thinking, prefix)
     thinking = score_thinking_language(
         split.thinking,
@@ -76,8 +87,9 @@ def score_trace(
         threshold=in_language_threshold,
         options=options,
     )
+    thinking_ok = thinking_lang_ok_for_gate(thinking)
     answer_language, answer_lang_ok = detect_answer_language(
-        split.answer_span or parsed,
+        split.answer_span,
         requested_answer_language,
         detector=detector,
         task=task,
@@ -91,11 +103,12 @@ def score_trace(
 
     gate: int | None = None
     if label is not None:
+        gate_parsed = parse_answer(split.answer_span, task, raw="", options=options, extract=extract)
         gate = hard_gate(
-            thinking_lang_ok=thinking.in_language_95,
+            thinking_lang_ok=thinking_ok,
             answer_lang_ok=answer_lang_ok,
             closed=closure.closed,
-            answer_matches_label=answers_match(parsed, label, task),
+            answer_matches_label=answers_match(gate_parsed, label, task),
         )
 
     return ScoreResult(
@@ -103,7 +116,7 @@ def score_trace(
         parsed_answer=parsed,
         thinking_lang_share=thinking.share,
         in_language_95=thinking.in_language_95,
-        thinking_lang_ok=thinking.in_language_95,
+        thinking_lang_ok=thinking_ok,
         answer_language=answer_language,
         answer_lang_ok=answer_lang_ok,
         closed=closure.closed,

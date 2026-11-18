@@ -20,8 +20,7 @@ from collections.abc import Sequence
 from nemotron.steps.eval.mr_l2.constants import COPY_MIN_CHARS, MCQ_AJ
 from nemotron.steps.eval.mr_l2.textnorm import (
     collapse_ws,
-    has_devanagari,
-    has_vietnamese_diacritics,
+    has_non_ascii_letter,
     is_numeric_or_symbol,
     normalize_for_copy,
     tokenize_words,
@@ -37,17 +36,20 @@ _LATEX_BRACK = re.compile(r"\\\[(?:.|\n)*?\\\]")
 _LATEX_ENV = re.compile(
     r"\\begin\{(?:equation|align|gather|multline)\*?\}(?:.|\n)*?\\end\{(?:equation|align|gather|multline)\*?\}"
 )
-_QUOTE = re.compile(r"[“\"]([^”\"]{3,})[”\"]")
-
 _SENT_SPLIT = re.compile(r"(?<=[\.!?…。！？\n])\s+")
 _OPT_PREFIX = re.compile(rf"^[{''.join(MCQ_AJ)}][\.\)\:]\s+", re.I)
 _OPT_LABEL = re.compile(rf"\b[{''.join(MCQ_AJ)}][\.\)\:]\s*", re.I)
 _OPT_TRAIL = re.compile(rf"^[0-9.,%\s/+\-*×÷=()]+[{''.join(MCQ_AJ)}]\.?\s*$", re.I)
 _MATH_OP = re.compile(r"[=+\-*/×÷^_\\()]")
-_CODE_HEAD = re.compile(
-    r"^(if|for|while|return|def|class|int|void|public|private|function|const|var|let)\b",
+_CODE_DECL = re.compile(
+    r"^(def|class|function|void|public|private|const|var|let|int)\b",
     re.I,
 )
+_CODE_CTRL = re.compile(
+    r"^(if|for|while|return|switch)\s*\(",
+    re.I,
+)
+_CODE_HEAD = _CODE_DECL
 _CODE_TOKEN = re.compile(
     r"\b(if|for|while|return|def|class|int|void|null|true|false|"
     r"function|const|var|let|display|print)\b",
@@ -72,7 +74,6 @@ def strip_allowed_spans(text: str) -> str:
     s = text or ""
     for pat in (_FENCE, _LATEX_ENV, _DISPLAY, _LATEX_PAREN, _LATEX_BRACK, _INLINE_MATH, _INLINE_CODE):
         s = pat.sub(" ", s)
-    s = _QUOTE.sub(" ", s)
     return collapse_ws(s)
 
 
@@ -106,7 +107,7 @@ def _is_identifier_formula(text: str) -> bool:
     """True for leftover identifier algebra such as ``S = (a+b)*h/2``."""
     if not _MATH_OP.search(text or ""):
         return False
-    if has_vietnamese_diacritics(text) or has_devanagari(text):
+    if has_non_ascii_letter(text):
         return False
     words = tokenize_words(text)
     if not words:
@@ -130,16 +131,15 @@ def is_option_recap(text: str) -> bool:
 def is_code_remainder(text: str) -> bool:
     """Bare code / pseudocode that is not wrapped in fences.
 
-    A Vietnamese (or other native) carrier sentence that merely mentions a
-    keyword like ``int`` is still scored; only code-shaped remainders are
-    allowed.
+    A carrier sentence in any language that merely mentions a keyword like
+    ``int`` is still scored; only code-shaped remainders are allowed.
     """
     s = collapse_ws(text)
     if not s:
         return True
-    if has_vietnamese_diacritics(s) or has_devanagari(s):
+    if has_non_ascii_letter(s):
         return False
-    if _CODE_HEAD.match(s):
+    if _CODE_DECL.match(s) or _CODE_CTRL.match(s):
         return True
     if _CODE_TOKEN.search(s) and any(ch in s for ch in "{};"):
         return True
