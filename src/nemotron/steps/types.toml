@@ -54,6 +54,9 @@ convert_to = { checkpoint_hf = "convert/merge_lora" }
 [eval_results]
 description = "Evaluation metrics and benchmark scores"
 
+[eval_traces_jsonl]
+description = "JSONL generation traces with think/answer text for native-reasoning L2 (in_language_95) scoring"
+
 [curation_report]
 description = "Integrity evidence for a curated corpus: per-shard readability, row counts, content digest, and comparison against a producer-emitted run manifest"
 

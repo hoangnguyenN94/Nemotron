@@ -1,0 +1,10 @@
+# Native-reasoning L2 scoring. CPU-only. Point input at traces.jsonl.
+
+input: ./traces.jsonl
+output_dir: ./output/mr_l2
+thinking_language_target: vi
+requested_answer_language: vi
+threshold: 0.95
+task: auto
+max_samples: 0
+dry_run: false

@@ -1,0 +1,99 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[step]
+id = "eval/mr_l2"
+name = "Native Reasoning L2 Evaluation"
+category = "eval"
+description = """\
+Score existing generation traces for native-reasoning L2 (`in_language_95`):
+word-weighted language share of thinking remainders after stripping maths,
+code, MCQ option recap, and copied question text. CPU-only. Also writes a
+fail-mode analysis (English CoT, English closer, mixed share, loop)."""
+tags = ["eval", "l2", "in_language_95", "lid", "multilingual", "cpu", "native-reasoning"]
+
+[[consumes]]
+type = "eval_traces_jsonl"
+description = "JSONL traces with raw_output or thinking/answer_span fields (or a directory containing traces.jsonl)."
+required = true
+
+[[produces]]
+type = "eval_results"
+description = "L2 metrics.json, scored.jsonl, analysis.json, and l2_fails.jsonl."
+
+[[parameters]]
+name = "input"
+description = "Path to traces.jsonl or a directory that contains traces.jsonl."
+
+[[parameters]]
+name = "output_dir"
+description = "Directory for scored traces, metrics, and fail analysis."
+default = "./output/mr_l2"
+
+[[parameters]]
+name = "thinking_language_target"
+description = "ISO 639-1 code used when a row has no thinking_language_target / source language."
+default = "vi"
+
+[[parameters]]
+name = "requested_answer_language"
+description = "ISO 639-1 code for answer-span LID. Numeric and lone MCQ letters are exempt."
+default = "vi"
+
+[[parameters]]
+name = "threshold"
+description = "Share at or above which an item passes L2."
+default = 0.95
+
+[[parameters]]
+name = "task"
+description = "Parser task (`numeric`, `mcq_aj`, `mcq_ae`, `polymath`, `instruction`) or `auto` to use the source field."
+default = "auto"
+
+[[parameters]]
+name = "max_samples"
+description = "Score only the first N traces. 0 = all."
+default = 0
+
+[[parameters]]
+name = "dry_run"
+description = "Count traces and write summary.dry-run.json without scoring."
+default = false
+
+[[strategies]]
+when = "you already have traces.jsonl from eval/model_eval or a native generation job"
+then = "run eval/mr_l2 on that JSONL; do not redeploy the model. L2 is a post-hoc LID score, not a generation step."
+
+[[strategies]]
+when = "comparing SFT / RL / base L2"
+then = "score each run's traces with the same threshold and the same thinking_language_target so rates are comparable"
+
+[[strategies]]
+when = "L2 is low on MCQ benches (VMLU, MMLU-ProX) but traces are still Vietnamese"
+then = "read analysis.json fail_primary. Option recap, identifier formulas, and short English closers are stripped or word-weighted; remaining fails are mixed-share or English CoT."
+
+[[errors]]
+name = "traces_missing"
+recovery = "Set input to a traces.jsonl file or a directory that contains traces.jsonl."
+
+[[errors]]
+name = "empty_raw_output"
+recovery = "Each row needs raw_output, or thinking plus answer_span so the scorer can reconstruct a Nano think/answer split."
+
+[reference]
+readme = "src/nemotron/steps/eval/mr_l2/README.md"
+lib = "src/nemotron/steps/eval/mr_l2/runtime.py"
+score = "src/nemotron/steps/eval/mr_l2/score.py"
+lid = "src/nemotron/steps/eval/mr_l2/lid.py"
+analyze = "src/nemotron/steps/eval/mr_l2/analyze.py"

@@ -1,0 +1,10 @@
+# Plumbing smoke: five synthetic traces next to this config. Not a quality claim.
+
+input: tiny_traces.jsonl
+output_dir: ./output/mr_l2_tiny
+thinking_language_target: vi
+requested_answer_language: vi
+threshold: 0.95
+task: auto
+max_samples: 0
+dry_run: false
