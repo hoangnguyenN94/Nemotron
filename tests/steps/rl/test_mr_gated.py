@@ -91,6 +91,42 @@ def test_gated_schema_refuses_hint_and_eval_source() -> None:
         validate_gated_record(PROMPT, {"gsm8k_train_vi:tiny"})
 
 
+def test_empty_thinking_is_minus_one_math_only_is_plus_one() -> None:
+    empty = gated_reward("<think></think>\n13", PROMPT)
+    maths = gated_reward("<think>16 - 3 = 13</think>\n13", PROMPT)
+    quoted = gated_reward(
+        '<think>"She starts with sixteen eggs and then eats three of them so thirteen remain."</think>\n13',
+        PROMPT,
+    )
+    assert empty["reward"] == -1
+    assert empty["in_language_95"]
+    assert not empty["thinking_lang_ok"]
+    assert maths["reward"] == 1
+    assert maths["thinking_lang_ok"]
+    assert quoted["reward"] == -1
+
+
+def test_foreign_and_mixed_thinking_is_minus_one() -> None:
+    zh = gated_reward("<think>她有十六个鸡蛋，吃了三个，还剩十三个。</think>\n13", PROMPT)
+    ru = gated_reward("<think>Она вычитает три яйца и получает тринадцать.</think>\n13", PROMPT)
+    mixed = gated_reward(
+        "<think>She has 16 eggs and eats 3 so there are 13 left không.</think>\n13",
+        PROMPT,
+    )
+    fr = gated_reward(
+        "<think>Résultat: elle soustrait trois oeufs et il reste treize.</think>\n13",
+        PROMPT,
+    )
+    assert zh["reward"] == ru["reward"] == mixed["reward"] == fr["reward"] == -1
+
+
+def test_empty_answer_span_does_not_read_boxed_from_think() -> None:
+    out = gated_reward(r"<think>Cô ấy trừ 3 quả và còn 13. \boxed{13}</think>", PROMPT)
+    assert out["parsed"] == ""
+    assert not out["answer_lang_ok"]
+    assert out["reward"] == -1
+
+
 def test_tiny_config_scores_plus_zero_minus(tmp_path: Path) -> None:
     out = tmp_path / "mr_gated"
     metrics = run_mr_gated(

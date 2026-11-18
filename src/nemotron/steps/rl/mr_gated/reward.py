@@ -18,8 +18,10 @@
     elif answer matches label AND closed:                 1
     else:                                                 0
 
-Unlabeled items are excluded by the caller, not scored 0. L2
-(`in_language_95`) comes from eval/mr_l2.
+Unlabeled items are excluded by the caller, not scored 0. Thinking-language
+is L2 (`in_language_95`) from eval/mr_l2. Completely empty thinking fails;
+maths-only remainders are language-neutral. Empty answer spans fail; the
+gate does not parse \\boxed / Đáp án from the think block.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from nemotron.steps.eval.mr_l2.lid import HeuristicDetector, LanguageDetector
+from nemotron.steps.eval.mr_l2.lid import LanguageDetector, default_detector
 from nemotron.steps.eval.mr_l2.score import score_trace, task_for_source
 from nemotron.steps.rl.mr_gated.schema import refuse_gold
 
@@ -59,7 +61,7 @@ def gated_reward(
         requested_answer_language=lang,
         n_tokens=n_tokens,
         label=label,
-        detector=detector or HeuristicDetector(),
+        detector=detector or default_detector(),
         path="train",
         max_tokens=max_tokens,
         options=row.get("options") if isinstance(row.get("options"), (list, tuple)) else None,

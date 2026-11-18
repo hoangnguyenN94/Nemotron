@@ -9,8 +9,11 @@ else:                                                 0
 ```
 
 Thinking-language is L2 (`in_language_95`) from [`eval/mr_l2`](../../eval/mr_l2/README.md).
-The scorer uses a frozen **label**, never eval gold. Unlabeled items are dropped
-by the data exporter, not scored 0.
+Completely empty thinking fails the gate; maths-only remainders are
+language-neutral and do not. The gate parser reads the **answer span only**
+(no `\boxed` / `Đáp án` fallback from `<think>`). The scorer uses a frozen
+**label**, never eval gold. Unlabeled items are dropped by the data exporter,
+not scored 0.
 
 This step validates the reward on existing rollouts. Policy optimization still
 goes through [`rl/nemo_rl/rlvr`](../nemo_rl/rlvr/README.md) (GRPO), with this
@@ -62,4 +65,5 @@ out = gated_reward(raw_generation, prompt_row)
 - Do not treat `config/tiny.yaml` as a training result.
 - Validate `n_plus` / `n_zero` / `n_minus` on a tiny rollout set before scaling
   `rl/nemo_rl/rlvr`.
-- Keep the L2 formula in `eval/mr_l2`; this step only consumes it.
+- Keep the L2 formula in `eval/mr_l2`; this step consumes it, fails empty
+  thinking, and parses the answer span only.
