@@ -1,6 +1,6 @@
 # eval/mr_l2
 
-CPU-only **native-reasoning L2** scoring for already-generated traces.
+**Native-reasoning L2** scoring for already-generated traces.
 
 L2 is `in_language_95`: after stripping maths, code, MCQ option recap, and
 copied question/option text, take the word-weighted share of *scored* thinking

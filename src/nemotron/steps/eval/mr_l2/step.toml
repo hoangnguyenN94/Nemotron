@@ -19,9 +19,9 @@ category = "eval"
 description = """\
 Score existing generation traces for native-reasoning L2 (`in_language_95`):
 word-weighted language share of thinking remainders after stripping maths,
-code, MCQ option recap, and copied question text. CPU-only. Also writes a
+code, MCQ option recap, and copied question text. Also writes a
 fail-mode analysis (English CoT, English closer, mixed share, loop)."""
-tags = ["eval", "l2", "in_language_95", "lid", "multilingual", "cpu", "native-reasoning"]
+tags = ["eval", "l2", "in_language_95", "lid", "multilingual", "native-reasoning"]
 
 [[consumes]]
 type = "eval_traces_jsonl"

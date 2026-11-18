@@ -31,7 +31,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native-reasoning L2 evaluation — CPU-only scoring of think-language share."""
+"""Native-reasoning L2 evaluation — scoring of think-language share."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-# Native-reasoning L2 scoring. CPU-only. Point input at traces.jsonl.
+# Native-reasoning L2 scoring. Point input at traces.jsonl.
 
 input: ./traces.jsonl
 output_dir: ./output/mr_l2
