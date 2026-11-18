@@ -25,6 +25,7 @@ RL failures are schema or reward-design failures, not optimizer failures.
 |---|---|---|---|
 | Static preference pairs (no online reward) | [`rl/nemo_rl/dpo`](nemo_rl/dpo/README.md) | `{prompt, chosen, rejected}` | `checkpoint_megatron` |
 | Programmatic / verifiable (math answer, tests, tool success) | [`rl/nemo_rl/rlvr`](nemo_rl/rlvr/README.md) | `{prompt, answer | tests | env_metadata}` | `checkpoint_megatron` |
+| Native-reasoning hard gate (`{+1, 0, −1}`, label only) | [`rl/mr_gated`](mr_gated/README.md) | `{unassisted_user, label}` + rollouts | `eval_results` |
 | Learned judge / GenRM-style comparison reward | [`rl/nemo_rl/rlhf`](nemo_rl/rlhf/README.md) | `{prompt}` + reward-model `checkpoint_hf` | `checkpoint_megatron` |
 
 All three consume an SFT-trained `checkpoint_megatron` policy as the warm
@@ -35,6 +36,7 @@ resource-server / GenRM rewards (`env.should_use_nemo_gym=true`).
 
 - Have static preference pairs and no reward function → **DPO**.
 - Reward is deterministic and codifiable (regex / unit test / answer match) → **RLVR**.
+- Native-reasoning unassisted GRPO with language + closure + label match → validate with **`rl/mr_gated`**, then train with **RLVR**.
 - Reward must be learned from human comparisons or a judge model → **RLHF**.
 - Sovereign deployment, custom reward server, or domain-specific tool rewards
   → RLVR or RLHF with NeMo-Gym (`config/nemo_gym.yaml`).
@@ -110,6 +112,7 @@ same artifact.
 uv run nemotron steps run rl/nemo_rl/dpo  -c tiny --dry-run
 uv run nemotron steps run rl/nemo_rl/rlvr -c tiny --dry-run
 uv run nemotron steps run rl/nemo_rl/rlhf -c tiny --dry-run
+uv run nemotron steps run rl/mr_gated -c tiny --dry-run
 ```
 
 ## Project layout for generated configs

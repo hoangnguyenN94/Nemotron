@@ -1,0 +1,8 @@
+# Hard-gate reward on unassisted rollouts. Point prompts at gated JSONL.
+
+input: ./traces.jsonl
+prompts: ./gated_prompts.jsonl
+output_dir: ./output/mr_gated
+eval_ids: null
+max_samples: 0
+dry_run: false

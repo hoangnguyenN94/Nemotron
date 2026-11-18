@@ -1,0 +1,3 @@
+{"item_id": "tiny:plus", "raw_output": "<think>Cô ấy trừ 3 quả và còn 13.</think>\n13"}
+{"item_id": "tiny:zero", "raw_output": "<think>Cô ấy trừ 3 quả và còn 10.</think>\n10"}
+{"item_id": "tiny:minus", "raw_output": "<think>She subtracts 3 and there are 13 left in total.</think>\n13"}

@@ -1,0 +1,93 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[step]
+id = "rl/mr_gated"
+name = "Native Reasoning Hard-Gate Reward"
+category = "rl"
+description = """\
+Score unassisted rollouts with the frozen native-reasoning hard gate
+({+1, 0, −1}): language fail is −1; parsed answer matching the frozen label
+and a closed think block is +1; otherwise 0. Label only — never gold.
+Uses eval/mr_l2 for L2 (`in_language_95`) and closure. Validate this reward
+on traces before scaling `rl/nemo_rl/rlvr` GRPO."""
+tags = ["rl", "rlvr", "hard-gate", "reward", "native-reasoning", "l2"]
+
+[[consumes]]
+type = "gated_prompt_jsonl"
+description = "Train-path prompts with unassisted_user + frozen label. No gold, hint, or eval-bench IDs."
+required = false
+
+[[consumes]]
+type = "eval_traces_jsonl"
+description = "Rollouts with raw_output (or thinking/answer_span). Joined to prompts by item_id."
+required = true
+
+[[produces]]
+type = "eval_results"
+description = "rewards.jsonl ({+1, 0, −1} plus L2/closure) and metrics.json."
+
+[[parameters]]
+name = "input"
+description = "Path to traces.jsonl or a directory that contains traces.jsonl."
+
+[[parameters]]
+name = "prompts"
+description = "Gated prompt JSONL (label, unassisted_user). Optional when each trace already carries the gated contract."
+
+[[parameters]]
+name = "output_dir"
+description = "Directory for rewards.jsonl and metrics.json."
+default = "./output/mr_gated"
+
+[[parameters]]
+name = "eval_ids"
+description = "Optional eval-id list. Any matching item_id on a prompt is contamination."
+
+[[parameters]]
+name = "max_samples"
+description = "Score only the first N traces. 0 = all."
+default = 0
+
+[[parameters]]
+name = "dry_run"
+description = "Count traces and prompts without scoring."
+default = false
+
+[[strategies]]
+when = "adding a hard-gate reward to GRPO / RLVR"
+then = "run rl/mr_gated on a tiny rollout set and inspect n_plus / n_zero / n_minus before scaling rl/nemo_rl/rlvr"
+
+[[strategies]]
+when = "the prompt JSONL has gold, hint, or guided_user"
+then = "refuse the shard. Gated RL is unassisted + label only; unlabeled items are dropped by the data exporter, not scored 0"
+
+[[strategies]]
+when = "L2 and hard-gate disagree in interpretation"
+then = "L2 is in_language_95 from eval/mr_l2. Hard-gate uses that bit as thinking-language ok; do not fork the LID formula"
+
+[[errors]]
+name = "gold_on_train_path"
+recovery = "Strip gold/answer fields from the prompt JSONL. Hard-gate matches a frozen label, never eval gold."
+
+[[errors]]
+name = "trace_without_prompt"
+recovery = "Give prompts= a gated JSONL keyed by item_id, or put unassisted_user + label on each trace row."
+
+[reference]
+readme = "src/nemotron/steps/rl/mr_gated/README.md"
+reward = "src/nemotron/steps/rl/mr_gated/reward.py"
+schema = "src/nemotron/steps/rl/mr_gated/schema.py"
+l2 = "src/nemotron/steps/eval/mr_l2/score.py"
+rlvr = "src/nemotron/steps/rl/nemo_rl/rlvr/README.md"

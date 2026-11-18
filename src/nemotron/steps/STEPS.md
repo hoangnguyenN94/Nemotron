@@ -73,6 +73,7 @@
 
 | Step | Description | Consumes | Produces |
 | --- | --- | --- | --- |
+| [rl/mr_gated](rl/mr_gated/) | Score unassisted rollouts with the frozen native-reasoning hard gate ({+1, 0, −1}): language fail is −1; parsed answer matching the frozen label and a closed think block is +1; otherwise 0. Label only — never gold. Uses eval/mr_l2 for L2 (`in_language_95`) and closure. Validate this reward on traces before scaling `rl/nemo_rl/rlvr` GRPO. | gated_prompt_jsonl (optional), eval_traces_jsonl | eval_results |
 | [rl/nemo_rl/dpo](rl/nemo_rl/dpo/) | Direct Preference Optimisation alignment with NeMo-RL. Consumes a preference dataset (chosen / rejected pairs) and an SFT-trained checkpoint. | training_jsonl, checkpoint_megatron | checkpoint_megatron |
 | [rl/nemo_rl/rlhf](rl/nemo_rl/rlhf/) | RLHF with a learned judge / generative reward model on top of NeMo-RL's GRPO loop. Uses NeMo-Gym for GenRM-style comparison rewards by default. | training_jsonl, checkpoint_megatron, checkpoint_hf | checkpoint_megatron |
 | [rl/nemo_rl/rlvr](rl/nemo_rl/rlvr/) | RL with Verifiable Rewards via GRPO (NeMo-RL). Designed for tasks with programmatic reward signals such as math problem solving or unit-tested code. Use config/nemo_gym.yaml for NeMo-Gym resource-server rewards. | training_jsonl, checkpoint_megatron | checkpoint_megatron |

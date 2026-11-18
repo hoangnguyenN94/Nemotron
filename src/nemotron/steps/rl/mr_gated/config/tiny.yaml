@@ -1,0 +1,7 @@
+# Plumbing smoke: synthetic gated prompts + traces. Not a quality claim.
+
+input: tiny_traces.jsonl
+prompts: tiny_prompts.jsonl
+output_dir: ./output/mr_gated_tiny
+max_samples: 0
+dry_run: false
