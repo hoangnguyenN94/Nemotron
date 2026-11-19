@@ -25,16 +25,21 @@ def hard_gate(
     """
     Frozen 1 / 0 / −1 rule.
 
-    Language fail always −1. Correctness and closure only distinguish 1 vs 0
-    after both language conditions pass.
+    Thinking-language fail always −1 (English / empty think). Answer-language
+    fail is −1 only after the trace is closed: unclosed or truncated native
+    thinking scores 0 so GRPO can learn to close, instead of looking like
+    English. Correctness only distinguishes 1 vs 0 after language passes.
 
     thinking_lang_ok is L2 vs a pluggable detector (any target language).
     Completely empty thinking fails; maths/code remainders are language-neutral.
-    Answer-language is the answer span only.
+    Answer-language is the answer span only. Empty span after a closed think
+    is still −1; the gate does not lift boxed / Đáp án out of the think block.
 
     Unlabeled items (<6/8) must be excluded by the caller, not scored 0.
     """
-    if not thinking_lang_ok or not answer_lang_ok:
+    if not thinking_lang_ok:
+        return -1
+    if closed and not answer_lang_ok:
         return -1
     if answer_matches_label and closed:
         return 1

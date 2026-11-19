@@ -3,14 +3,18 @@
 Frozen **hard-gate** reward for native-reasoning Approach 1 (unassisted GRPO).
 
 ```
-if thinking-language fails OR answer-language fails:  -1
-elif answer matches label AND closed:                 1
-else:                                                 0
+if thinking-language fails:                            -1
+elif closed AND answer-language fails:                 -1
+elif answer matches label AND closed:                  1
+else:                                                  0
 ```
 
 Thinking-language is L2 (`in_language_95`) from [`eval/mr_l2`](../../eval/mr_l2/README.md).
 Completely empty thinking fails the gate; maths-only remainders are
-language-neutral and do not. The gate parser reads the **answer span only**
+language-neutral and do not. Thinking-language fail is always −1. Empty
+answer after a **closed** think is −1. Unclosed or truncated native thinking
+is **0**, so GRPO can learn to close instead of treating a long Vietnamese
+think like English. The gate parser reads the **answer span only**
 (no `\boxed` / `Đáp án` fallback from `<think>`). The scorer uses a frozen
 **label**, never eval gold. Unlabeled items are dropped by the data exporter,
 not scored 0.

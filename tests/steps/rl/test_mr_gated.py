@@ -51,6 +51,9 @@ def test_hard_gate_truth_table() -> None:
     assert hard_gate(thinking_lang_ok=True, answer_lang_ok=True, closed=False, answer_matches_label=True) == 0
     assert hard_gate(thinking_lang_ok=False, answer_lang_ok=True, closed=True, answer_matches_label=True) == -1
     assert hard_gate(thinking_lang_ok=True, answer_lang_ok=False, closed=True, answer_matches_label=True) == -1
+    assert hard_gate(thinking_lang_ok=False, answer_lang_ok=False, closed=False, answer_matches_label=False) == -1
+    assert hard_gate(thinking_lang_ok=True, answer_lang_ok=False, closed=False, answer_matches_label=False) == 0
+    assert hard_gate(thinking_lang_ok=True, answer_lang_ok=False, closed=False, answer_matches_label=True) == 0
 
 
 def test_gated_reward_plus_one_on_vi_closed_match() -> None:
@@ -124,6 +127,32 @@ def test_empty_answer_span_does_not_read_boxed_from_think() -> None:
     out = gated_reward(r"<think>Cô ấy trừ 3 quả và còn 13. \boxed{13}</think>", PROMPT)
     assert out["parsed"] == ""
     assert not out["answer_lang_ok"]
+    assert out["reward"] == -1
+
+
+def test_unclosed_native_think_is_zero_not_minus_one() -> None:
+    out = gated_reward(
+        "<think>Cô ấy trừ 3 quả trứng và còn 13 quả, tiếp tục giải",
+        PROMPT,
+        n_tokens=1536,
+        max_tokens=1536,
+    )
+    assert out["thinking_lang_ok"]
+    assert not out["closed"]
+    assert out["truncated"]
+    assert not out["answer_lang_ok"]
+    assert out["reward"] == 0
+
+
+def test_unclosed_english_think_is_still_minus_one() -> None:
+    out = gated_reward(
+        "<think>She subtracts 3 eggs and there are 13 left, keep going",
+        PROMPT,
+        n_tokens=1536,
+        max_tokens=1536,
+    )
+    assert not out["thinking_lang_ok"]
+    assert not out["closed"]
     assert out["reward"] == -1
 
 
