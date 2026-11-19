@@ -9,7 +9,7 @@ stay on [`eval/model_eval`](../model_eval/README.md). Do not mix those scores
 with this step.
 
 Agent benches on the [Nemotron Adoption Eval Sheet](https://docs.google.com/spreadsheets/d/1gWhZngquu4fngp1zop73wu1F_zsssBSS5z3vHuopBYo/edit?gid=1841659604#gid=1841659604)
-(SEATau-vi, τ-bench 2.0 Hindi/English) are **not** this step.
+(SEATau-vi, τ-bench 2.0 Hindi/English) live on [`eval/mr_agent`](../mr_agent/README.md).
 
 L2 on traces this step already wrote: [`eval/mr_l2`](../mr_l2/README.md).
 

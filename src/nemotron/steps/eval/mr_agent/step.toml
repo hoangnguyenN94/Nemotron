@@ -1,0 +1,123 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[step]
+id = "eval/mr_agent"
+name = "Native Reasoning Agent Evaluation"
+category = "eval"
+description = """\
+Run SEATau-vi and τ-bench 2.0 Hindi/English (full five domains) against a hosted
+OpenAI-compatible agent plus a GPT-5.5 user simulator. Clones pinned harness SHAs,
+applies the Native-reasoning think-prefix overlay, and writes pass@1. Does not
+deploy the model. Single-turn W1.1 benches stay on eval/mr_bench. PolyGym eval/v1
+is not this step."""
+tags = ["eval", "native-reasoning", "seatau", "tau2", "agent"]
+
+[[consumes]]
+type = "eval_endpoint"
+description = "Hosted OpenAI-compatible /v1/chat/completions URL for the agent. Direct mode never starts the server."
+required = false
+
+[[produces]]
+type = "eval_results"
+description = "metrics.json (pass@1, CS-overlap slice, language_correctness) plus copied simulations/results.json."
+
+[[parameters]]
+name = "benchmark"
+description = "Suite: tiny, seatau_vi, tau2_hi, tau2_en."
+default = "seatau_vi"
+
+[[parameters]]
+name = "model_url"
+description = "Agent endpoint URL. Falls back to EVAL_ENDPOINT_URL / SEATAU_AGENT_API_BASE."
+
+[[parameters]]
+name = "model_name"
+description = "Served agent model id. Falls back to EVAL_MODEL_HANDLE / SEATAU_AGENT_MODEL."
+
+[[parameters]]
+name = "mode"
+description = "`free` (enable_thinking, no prefix) or `forced` (W1.1 opener + vLLM prefill)."
+default = "free"
+
+[[parameters]]
+name = "scenario"
+description = "SEATau only: english, l2_tools, l2_interaction (sheet cells), l2_domain (paper primary)."
+default = "l2_interaction"
+
+[[parameters]]
+name = "domains"
+description = "Comma-separated domain filter. Default: SEATau airline/retail/telecom; τ-bench five domains including banking_knowledge and intake."
+
+[[parameters]]
+name = "num_trials"
+description = "Trials per task. Sheet: SEATau 3, τ-bench 4."
+
+[[parameters]]
+name = "num_tasks"
+description = "Cap tasks per domain (0/empty = full split). Use for smoke runs."
+
+[[parameters]]
+name = "data_root"
+description = "Parent directory for cloned harness checkouts (data/seatau, data/tau2)."
+default = "./data"
+
+[[parameters]]
+name = "output_dir"
+description = "Durable directory for metrics.json and copied simulations."
+default = "./output/mr_agent"
+
+[[parameters]]
+name = "fetch"
+description = "Clone the pinned SHA and apply overlays."
+default = true
+
+[[parameters]]
+name = "dry_run"
+description = "Write commands.json without cloning or calling models."
+default = false
+
+[[parameters]]
+name = "vllm_prefill"
+description = "Forced mode: send vLLM continue_final_message. Do not set on NIM/OpenAI."
+
+[[parameters]]
+name = "api_key_name"
+description = "Env var holding the GPT-5.5 / NVIDIA inference-api token. Never put the raw key in YAML."
+default = "NGC_API_KEY"
+
+[[strategies]]
+when = "you need Native-reasoning agent numbers (SEATau-vi, τ-bench HI/EN)"
+then = "run eval/mr_agent against a hosted agent. GPT-5.5 user-sim needs NGC_API_KEY. Do not use eval/mr_bench."
+
+[[strategies]]
+when = "comparing Default vs native on the Adoption Eval Sheet"
+then = "run twice: mode=free and mode=forced. Same checkpoint, same domains, same num_trials."
+
+[[strategies]]
+when = "you need the three-domain overlap with SEATau-vi from a τ-bench run"
+then = "read metrics.json cs_overlap_pass1 (airline/retail/telecom). Headline pass1 is all five domains."
+
+[[errors]]
+name = "endpoint_unreachable"
+recovery = "Host the agent first. Direct mode never starts vLLM. Set model_url / EVAL_ENDPOINT_URL."
+
+[[errors]]
+name = "user_sim_key_missing"
+recovery = "Export NGC_API_KEY (or api_key_name) for the GPT-5.5 user simulator on inference-api.nvidia.com."
+
+[reference]
+readme = "src/nemotron/steps/eval/mr_agent/README.md"
+lib = "src/nemotron/steps/eval/mr_agent/runtime.py"
+overlay = "src/nemotron/steps/eval/mr_agent/overlay.py"

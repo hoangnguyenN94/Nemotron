@@ -1,0 +1,8 @@
+defaults: default.yaml
+
+benchmark: tau2_hi
+mode: free
+num_trials: 4
+max_concurrency: 2
+thinking_language_target: hi
+output_dir: ./output/mr_agent/tau2_hi

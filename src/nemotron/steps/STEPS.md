@@ -46,6 +46,7 @@
 | --- | --- | --- | --- |
 | [eval/model_eval](eval/model_eval/) | Deploy a Megatron Bridge checkpoint behind an OpenAI-compatible endpoint, or evaluate an existing hosted endpoint, with NeMo Evaluator Launcher. | checkpoint_megatron (optional) | eval_results |
 | [eval/mr_bench](eval/mr_bench/) | Generate and score the Native-reasoning W1.1 suite (MGSM, PolyMath/PluraMath, MMLU-ProX, VMLU, GSM8K-Hi, MILU-1.5, m-ArenaHard) against a hosted OpenAI-compatible endpoint. Writes traces.jsonl plus accuracy / DW-ACC / in_language_95 / closed. Catalog lm-eval numbers stay on eval/model_eval. | eval_endpoint (optional) | eval_results, eval_traces_jsonl |
+| [eval/mr_agent](eval/mr_agent/) | Run SEATau-vi and τ-bench 2.0 Hindi/English (full five domains) against a hosted agent plus GPT-5.5 user-sim. Clones pinned harness SHAs, applies the think-prefix overlay, writes pass@1. PolyGym eval/v1 is not this step. | eval_endpoint (optional) | eval_results |
 | [eval/mr_l2](eval/mr_l2/) | Score existing generation traces for native-reasoning L2 (`in_language_95`): word-weighted language share of thinking remainders after stripping maths, code, MCQ option recap, and copied question text. Also writes a fail-mode analysis (English CoT, English closer, mixed share, loop). | eval_traces_jsonl | eval_results |
 
 ## optimize — Model Optimization

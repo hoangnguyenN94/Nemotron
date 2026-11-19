@@ -1,0 +1,16 @@
+# Plumbing smoke: one retail task, dry-run, no clone, no GPU.
+
+benchmark: tiny
+model_url: http://127.0.0.1:8000/v1
+model_name: dummy
+mode: free
+scenario: l2_interaction
+data_root: .
+output_dir: ./output/mr_agent_tiny
+dry_run: true
+fetch: false
+sync: false
+num_trials: 1
+num_tasks: 1
+max_concurrency: 1
+thinking_language_target: vi

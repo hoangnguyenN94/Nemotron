@@ -1,0 +1,18 @@
+# Sheet Vietnamese agent slot: SEATau-vi l2_interaction, 3 domains × 3 trials.
+# Host the agent first. GPT-5.5 user-sim needs NGC_API_KEY.
+
+benchmark: seatau_vi
+model_url: ""
+model_name: ""
+mode: free
+scenario: l2_interaction
+data_root: ./data
+output_dir: ./output/mr_agent
+dry_run: false
+fetch: true
+sync: true
+num_trials: 3
+max_concurrency: 1
+thinking_language_target: vi
+api_key_name: NGC_API_KEY
+agent_tag: mr-agent

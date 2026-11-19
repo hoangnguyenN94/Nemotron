@@ -1,0 +1,6 @@
+defaults: default.yaml
+
+benchmark: seatau_vi
+scenario: l2_interaction
+thinking_language_target: vi
+output_dir: ./output/mr_agent/seatau_vi
