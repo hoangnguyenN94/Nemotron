@@ -1,0 +1,7 @@
+defaults: default.yaml
+
+benchmark: m_arena_hard_hi
+thinking_language_target: hi
+requested_answer_language: hi
+prompt_style: contract
+output_dir: ./output/mr_bench/m_arena_hard_hi

@@ -1,0 +1,7 @@
+defaults: default.yaml
+
+benchmark: gsm8k_hi
+thinking_language_target: hi
+requested_answer_language: hi
+prompt_style: contract
+output_dir: ./output/mr_bench/gsm8k_hi

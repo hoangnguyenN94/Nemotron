@@ -1,0 +1,14 @@
+# Plumbing smoke: two bundled items. Not a quality claim. No Hub, no GPU.
+
+benchmark: tiny
+model_url: http://127.0.0.1:8000/v1
+model_name: dummy
+mode: free
+data_root: .
+output_dir: ./output/mr_bench_tiny
+dry_run: true
+fetch: false
+max_samples: 0
+concurrency: 1
+thinking_language_target: vi
+requested_answer_language: vi

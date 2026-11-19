@@ -1,0 +1,17 @@
+# Cheap W1.1 default: Global-MGSM Vietnamese (250 items).
+# Set model_url / EVAL_ENDPOINT_URL and EVAL_MODEL_HANDLE before a live run.
+
+benchmark: mgsm_vi
+model_url: ""
+model_name: ""
+mode: free
+data_root: ./data
+output_dir: ./output/mr_bench
+dry_run: false
+fetch: true
+max_samples: 0
+concurrency: 4
+timeout: 600
+thinking_language_target: vi
+requested_answer_language: vi
+api_key_name: NVIDIA_API_KEY

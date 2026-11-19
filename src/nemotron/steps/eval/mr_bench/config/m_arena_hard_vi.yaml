@@ -1,0 +1,7 @@
+defaults: default.yaml
+
+benchmark: m_arena_hard_vi
+thinking_language_target: vi
+requested_answer_language: vi
+prompt_style: contract
+output_dir: ./output/mr_bench/m_arena_hard_vi

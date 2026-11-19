@@ -1,0 +1,7 @@
+defaults: default.yaml
+
+benchmark: polymath_vi
+thinking_language_target: vi
+requested_answer_language: vi
+prompt_style: polymath
+output_dir: ./output/mr_bench/polymath_vi

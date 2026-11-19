@@ -1,0 +1,7 @@
+defaults: default.yaml
+
+benchmark: mmlu_prox_en
+thinking_language_target: en
+requested_answer_language: en
+prompt_style: mmlu-prox
+output_dir: ./output/mr_bench/mmlu_prox_en

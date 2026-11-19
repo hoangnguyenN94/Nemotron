@@ -9,7 +9,8 @@ higher**. Empty or fully-allowed remainders do not enter the denominator
 (`share = 1.0`). Accuracy is independent of L2.
 
 This step does **not** deploy a model. Point it at `traces.jsonl` from
-`eval/model_eval` or a native generation job.
+[`eval/mr_bench`](../mr_bench/README.md), `eval/model_eval`, or a native
+generation job.
 
 ## Files
 

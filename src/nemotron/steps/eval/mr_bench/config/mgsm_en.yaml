@@ -1,0 +1,7 @@
+defaults: default.yaml
+
+benchmark: mgsm_en
+thinking_language_target: en
+requested_answer_language: en
+prompt_style: contract
+output_dir: ./output/mr_bench/mgsm_en

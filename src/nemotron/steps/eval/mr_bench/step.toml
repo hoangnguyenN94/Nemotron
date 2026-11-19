@@ -1,0 +1,134 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[step]
+id = "eval/mr_bench"
+name = "Native Reasoning Benchmark Evaluation"
+category = "eval"
+description = """\
+Generate and score the Native-reasoning W1.1 suite (MGSM, PolyMath/PluraMath,
+MMLU-ProX, VMLU, GSM8K-Hi, MILU-1.5, m-ArenaHard) against a hosted
+OpenAI-compatible endpoint. Writes traces.jsonl plus W1.1 metrics (accuracy,
+DW-ACC, in_language_95, closed). Does not deploy the model. Catalog-comparable
+lm-eval numbers stay on eval/model_eval. Agent benches (SEATau, τ-bench) are
+not this step."""
+tags = ["eval", "native-reasoning", "w1.1", "mgsm", "polymath", "mmlu-prox", "vmlu"]
+
+[[consumes]]
+type = "eval_endpoint"
+description = "Hosted OpenAI-compatible /v1/chat/completions URL. Direct mode never starts the server."
+required = false
+
+[[produces]]
+type = "eval_results"
+description = "traces.jsonl, metrics.json, and submission.csv for VMLU."
+
+[[produces]]
+type = "eval_traces_jsonl"
+description = "Per-item W1.1 sample log (raw_output, think/answer split, L2, closed, parsed answer)."
+
+[[parameters]]
+name = "benchmark"
+description = "Suite name: tiny, mgsm_vi, mgsm_en, gsm8k_hi, gsm8k_en, polymath_vi, polymath_hi, polymath_en, mmlu_prox_vi, mmlu_prox_hi, mmlu_prox_en, vmlu, milu_1_5, ifeval, m_arena_hard_vi, m_arena_hard_hi."
+default = "mgsm_vi"
+
+[[parameters]]
+name = "model_url"
+description = "OpenAI-compatible endpoint URL. Falls back to EVAL_ENDPOINT_URL."
+
+[[parameters]]
+name = "model_name"
+description = "Served model id. Falls back to EVAL_MODEL_HANDLE or /v1/models."
+
+[[parameters]]
+name = "data_root"
+description = "Directory that holds (or will receive) parquet/jsonl benches. Hugging Face fetch writes here."
+default = "./data"
+
+[[parameters]]
+name = "output_dir"
+description = "Durable directory for traces.jsonl and metrics.json."
+default = "./output/mr_bench"
+
+[[parameters]]
+name = "mode"
+description = "`free` (no language prefix) or `forced` (W1.1 thinking opener in the target language)."
+default = "free"
+
+[[parameters]]
+name = "prompt_style"
+description = "`contract` (W1.1 0-shot), `mmlu-prox` (official 5-shot), `polymath` (official boxed note + DW-ACC), `vmlu-leaderboard`. Empty = official style for MMLU-ProX and PolyMath, contract otherwise."
+
+[[parameters]]
+name = "thinking_language_target"
+description = "ISO 639-1 code for think-language L2. Empty = language of the benchmark."
+
+[[parameters]]
+name = "max_samples"
+description = "Cap items (0 = all). Use for smoke runs."
+default = 0
+
+[[parameters]]
+name = "concurrency"
+description = "Parallel HTTP requests against the hosted endpoint."
+default = 4
+
+[[parameters]]
+name = "fetch"
+description = "Download missing bench files from Hugging Face into data_root."
+default = true
+
+[[parameters]]
+name = "dry_run"
+description = "Write prompts.jsonl without calling the model."
+default = false
+
+[[parameters]]
+name = "vllm_prefill"
+description = "Forced mode: send vLLM continue_final_message. Do not set on NIM/OpenAI."
+default = false
+
+[[parameters]]
+name = "api_key_name"
+description = "Environment variable that holds the endpoint token. Never put the raw key in YAML."
+default = "NVIDIA_API_KEY"
+
+[[strategies]]
+when = "you need Native-reasoning product numbers (think language, closed, DW-ACC, VMLU CSV)"
+then = "run eval/mr_bench against a hosted endpoint. Do not use eval/model_eval acc as the W1.1 headline."
+
+[[strategies]]
+when = "you need catalog-comparable MMLU-ProX / IFEval / MILU / GSM8K-Indic"
+then = "use eval/model_eval. Those scores are a different prompt and decoder."
+
+[[strategies]]
+when = "comparing Default vs native on the Adoption Eval Sheet"
+then = "run twice: mode=free (Default) and mode=forced with thinking_language_target set to vi/hi. Same checkpoint, same prompt_style."
+
+[[strategies]]
+when = "you already have traces.jsonl"
+then = "score L2 with eval/mr_l2; do not redeploy. mr_bench is the generator."
+
+[[errors]]
+name = "endpoint_unreachable"
+recovery = "Host the model first. Direct mode never starts vLLM. Set model_url / EVAL_ENDPOINT_URL."
+
+[[errors]]
+name = "no_items"
+recovery = "Set fetch=true and HF_TOKEN for gated MILU-1.5, or copy parquet/jsonl into data_root."
+
+[reference]
+readme = "src/nemotron/steps/eval/mr_bench/README.md"
+lib = "src/nemotron/steps/eval/mr_bench/runtime.py"
+score = "src/nemotron/steps/eval/mr_l2/score.py"

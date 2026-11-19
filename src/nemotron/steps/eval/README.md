@@ -15,14 +15,19 @@ how you know SFT, RL, optimization, or conversion actually helped.
 
 | Need | Step | Input | Output |
 |---|---|---|---|
-| Run a benchmark suite via NeMo Evaluator Launcher | [`eval/model_eval`](model_eval/README.md) | hosted endpoint or `checkpoint_megatron` | `eval_results` |
+| Run a catalog benchmark suite via NeMo Evaluator Launcher | [`eval/model_eval`](model_eval/README.md) | hosted endpoint or `checkpoint_megatron` | `eval_results` |
+| Generate + score Native-reasoning W1.1 benches (MGSM, PolyMath, MMLU-ProX, VMLU, …) | [`eval/mr_bench`](mr_bench/README.md) | hosted OpenAI-compatible endpoint | `eval_results` + `eval_traces_jsonl` |
 | Score think-language L2 (`in_language_95`) on existing traces | [`eval/mr_l2`](mr_l2/README.md) | `eval_traces_jsonl` (`traces.jsonl`) | `eval_results` |
 
 ## Data And Artifact Flow
 
 ```text
 hosted endpoint
-  -> eval/model_eval -> eval_results
+  -> eval/model_eval -> eval_results          # catalog acc (lm-eval / launcher)
+
+hosted endpoint
+  -> eval/mr_bench -> traces.jsonl + metrics.json   # W1.1 product numbers
+       -> eval/mr_l2 -> L2 analysis
 
 checkpoint_megatron (concrete iter_*)
   -> eval/model_eval (NeMo Evaluator Launcher deploys + runs)
@@ -44,3 +49,4 @@ Megatron path.
 - Don't ship hosted API keys in YAML; store the variable name only.
 - Don't treat a `limit_samples=1` smoke as evidence of model quality.
 - Don't read a low L2 as English-only CoT until `eval/mr_l2` analysis.json is inspected.
+- Don't mix `eval/model_eval` catalog accuracy with `eval/mr_bench` W1.1 numbers.

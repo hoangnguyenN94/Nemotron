@@ -1,0 +1,7 @@
+defaults: default.yaml
+
+benchmark: polymath_hi
+thinking_language_target: hi
+requested_answer_language: hi
+prompt_style: polymath
+output_dir: ./output/mr_bench/polymath_hi
