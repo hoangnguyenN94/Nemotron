@@ -14,14 +14,17 @@
 
 """Hard-gate reward for native-reasoning gated RL. Label only; never gold.
 
-    if thinking-language fails OR answer-language fails:  -1
-    elif answer matches label AND closed:                 1
-    else:                                                 0
+    if thinking-language fails:                            -1
+    elif closed AND answer-language fails:                 -1
+    elif answer matches label AND closed:                  1
+    else:                                                  0
 
 Unlabeled items are excluded by the caller, not scored 0. Thinking-language
 is L2 (`in_language_95`) from eval/mr_l2. Completely empty thinking fails;
-maths-only remainders are language-neutral. Empty answer spans fail; the
-gate does not parse \\boxed / Đáp án from the think block.
+maths-only remainders are language-neutral. Empty answer spans fail the
+answer-language field; the gate applies that as −1 only once the think is
+closed. Unclosed / truncated native thinking is 0. The gate does not parse
+\\boxed / Đáp án from the think block.
 """
 
 from __future__ import annotations

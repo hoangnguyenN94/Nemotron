@@ -1,0 +1,87 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Overlay on nano4b.yaml: GRPO for Nemotron 3 Nano 4B with the hard-gate reward
+# from rl/mr_gated as the verifier (+1 / 0 / -1, see rl/mr_gated/README.md).
+#
+# Data: every question of namfam/gsm8k-vietnamese `train` (6,725) plus a quarter
+# of their English originals (1,681), picked evenly across reasoning steps,
+# operations and question length. Validation uses the `val` split the same way.
+# The prompt is the plain question, as the gated prompt contract requires.
+# The validation "accuracy" NeMo-RL prints is the mean reward, in [-1, 1].
+#
+# Required env: RL_OUTPUT_DIR. Optional: RL_POLICY_MODEL, WANDB_NAME
+#
+#   nemotron steps run rl/nemo_rl/rlvr -c nano4b_mr_gated --batch lepton_nano4b_mr_gated_sft
+
+defaults: nano4b.yaml
+
+run:
+  env:
+    # The reward imports eval/mr_l2. Only the step's own category (rl/) is
+    # shipped to the cluster by default, so ship eval/ as well.
+    source_branches: [eval]
+
+grpo:
+  # One pass over the 8,406 training prompts at 56 prompts per step.
+  max_num_steps: 150
+  val_period: 10
+
+policy:
+  tokenizer:
+    chat_template_kwargs:
+      enable_thinking: true
+  # Prompts are under 500 tokens; the rest is for thinking plus answer.
+  max_total_sequence_length: 2048
+  generation:
+    max_new_tokens: 1536
+    # Rollouts sampled with top_p 1.0 killed training within 7 steps, four runs
+    # out of four, with "found Inf in local grad norm" from Megatron.
+    top_p: 0.95
+
+env:
+  # Modules whose register() adds the dataset, processor and environment below.
+  plugins:
+    - nemotron.steps.rl.mr_gated.nemo_rl_plugin
+  mr_gated:
+    # Token count and budget for the reward's closure check.
+    tokenizer_name: ${policy.model_name}
+    max_tokens: ${policy.generation.max_new_tokens}
+    # Print gate rates per language every this many scored responses.
+    log_every: 448
+
+data:
+  train:
+    dataset_name: mr_gated_gsm8k
+    split: train
+    english_fraction: 0.25
+  validation:
+    dataset_name: mr_gated_gsm8k
+    split: val
+    english_fraction: 0.25
+  default:
+    env_name: mr_gated
+    processor: mr_gated_processor
+    prompt_file: null
+
+checkpointing:
+  checkpoint_dir: ${oc.env:RL_OUTPUT_DIR}/checkpoints
+  # A rerun resumes from the latest checkpoint, so a crash costs at most this many steps.
+  save_period: 5
+
+logger:
+  log_dir: ${oc.env:RL_OUTPUT_DIR}/logs
+
+cluster:
+  num_nodes: 1
