@@ -33,7 +33,11 @@ Start from `config/tiny.yaml` for launch validation and `config/default.yaml`
 for the production-shaped Nano topology. `config/lightning35.yaml` is a
 `defaults: default.yaml` overlay for Nemotron 3.5 Lightning 30B-A3B packed LoRA
 at 4k: it keeps LoRA dim/alpha and `hf_load`, and overrides the Lightning
-recipe, extra target modules, TP/EP, and `L35_*` paths. In a project overlay,
+recipe, extra target modules, TP/EP, and `L35_*` paths.
+`config/nano4b_mr_vi.yaml` is a standalone config for Nemotron 3 Nano 4B LoRA
+at 8k on the `data_prep/mr_sft_chat` data (Tiny Aya multilingual reasoning,
+Vietnamese plus English originals); it starts from the released HF checkpoint
+and also exports HF PEFT adapters. In a project overlay,
 the first fields developers usually change are:
 
 - `checkpoint.pretrained_checkpoint`: concrete Megatron base checkpoint.
@@ -64,6 +68,7 @@ Related patterns:
 
 - Set `checkpoint.pretrained_checkpoint` to a real Megatron checkpoint directory for PEFT; placeholders and parent output directories fail validation.
 - Keep `load_hf_weights: false` for PEFT: the frozen base must be a Megatron checkpoint (`checkpoint.pretrained_checkpoint`). PEFT cannot bootstrap from HF weights — convert HF to Megatron first (run SFT or `convert/hf_to_megatron`), then point `pretrained_checkpoint` at the result.
+- Exception on `nemo:26.08` with the pinned Megatron-Bridge (0c565c9 or later): the frozen base may be a local HF full-model directory. Set `hf_model_path` (the runner resolves a model id to its local snapshot) or point `checkpoint.pretrained_checkpoint` at the directory; Megatron-Bridge loads it in its PEFT hook, so no conversion run is needed. `checkpoint.also_save_hf_checkpoint: true` then writes each adapter as an HF PEFT directory as well. See `config/nano4b_mr_vi.yaml`.
 - Keep `model.sequence_parallel: true` when `model.tensor_model_parallel_size > 1` and MoE is enabled.
 - When checkpoint save reliability matters more than async throughput, prefer `checkpoint.async_save: false`, `checkpoint.fully_parallel_save: false`, `checkpoint.save_optim: false`, and `checkpoint.save_rng: false`.
 - `dataset.packed_sequence_specs.packed_train_data_path` should point at `splits/train/*.parquet` produced by `data_prep/sft_packing`.
@@ -90,6 +95,7 @@ uv run nemotron steps run peft/megatron_bridge \
   -c <project>/config/peft_megatron_bridge.yaml
 
 uv run nemotron steps run peft/megatron_bridge -c lightning35 --batch <profile>
+uv run nemotron steps run peft/megatron_bridge -c nano4b_mr_vi --batch lepton_nano4b_mr_lora
 ```
 
 ## Repository Layout
@@ -100,6 +106,7 @@ uv run nemotron steps run peft/megatron_bridge -c lightning35 --batch <profile>
   - `src/nemotron/steps/peft/megatron_bridge/config/default.yaml`
   - `src/nemotron/steps/peft/megatron_bridge/config/tiny.yaml`
   - `src/nemotron/steps/peft/megatron_bridge/config/lightning35.yaml` (`defaults: default.yaml` overlay)
+  - `src/nemotron/steps/peft/megatron_bridge/config/nano4b_mr_vi.yaml` (standalone, Nano 4B)
 
 ## Guardrails
 

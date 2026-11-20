@@ -140,3 +140,95 @@ def test_maybe_apply_peft_constructs_lora_when_helpers_are_gone(
     assert isinstance(cfg.peft, FakeLoRA)
     assert cfg.peft.kwargs["dim"] == 16
     assert cfg.peft.kwargs["target_modules"] == ["linear_qkv", "in_proj"]
+
+
+def _peft_cfg(pretrained: str | None = None) -> SimpleNamespace:
+    checkpoint = SimpleNamespace(pretrained_checkpoint=pretrained, load=None, save="/ckpt/adapter")
+    return SimpleNamespace(checkpoint=checkpoint, model="recipe-model")
+
+
+def _install_checkpoint_utils(
+    monkeypatch: pytest.MonkeyPatch, *, megatron_dirs: set[str], hf_dirs: set[str] | None
+) -> None:
+    """Stub Megatron-Bridge checkpoint detection; ``hf_dirs=None`` models a release without HF bases."""
+    module = ModuleType("megatron.bridge.training.utils.checkpoint_utils")
+    module.checkpoint_exists = lambda path: path in megatron_dirs
+    if hf_dirs is not None:
+        module.is_hf_checkpoint_dir = lambda path: path in hf_dirs
+    _install_module(monkeypatch, "megatron.bridge.training.utils.checkpoint_utils", module)
+
+
+def _peft_container(**extra: object) -> dict:
+    return {**_peft_yaml(), "hf_load": {"inherit_save_as_load": False}, **extra}
+
+
+def test_peft_base_resolves_hf_model_id_to_its_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    import huggingface_hub
+
+    _install_checkpoint_utils(monkeypatch, megatron_dirs=set(), hf_dirs={"/hf/snapshots/abc"})
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo_id: "/hf/snapshots/abc")
+
+    cfg = _peft_cfg()
+    runner._maybe_load_hf_weights(cfg, _peft_container(hf_model_path="org/model", trust_remote_code=True))
+
+    assert cfg.checkpoint.pretrained_checkpoint == "/hf/snapshots/abc"
+    assert cfg.checkpoint.hf_trust_remote_code is True
+    # Megatron-Bridge loads the base in its PEFT hook; the runner must not build it too.
+    assert cfg.model == "recipe-model"
+    assert cfg.checkpoint.load is None
+
+
+def test_peft_base_keeps_explicit_hf_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_checkpoint_utils(monkeypatch, megatron_dirs=set(), hf_dirs={"/models/base-hf"})
+
+    cfg = _peft_cfg("/models/base-hf")
+    runner._maybe_load_hf_weights(cfg, _peft_container(hf_model_path="org/other-model"))
+
+    assert cfg.checkpoint.pretrained_checkpoint == "/models/base-hf"
+    assert cfg.checkpoint.hf_trust_remote_code is False
+
+
+def test_peft_base_keeps_megatron_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_checkpoint_utils(monkeypatch, megatron_dirs={"/ckpt/base"}, hf_dirs=set())
+
+    cfg = _peft_cfg("/ckpt/base")
+    runner._maybe_load_hf_weights(cfg, _peft_container())
+
+    assert cfg.checkpoint.pretrained_checkpoint == "/ckpt/base"
+    assert not hasattr(cfg.checkpoint, "hf_trust_remote_code")
+
+
+@pytest.mark.parametrize("hf_dirs", [None, set()], ids=["old-megatron-bridge", "not-an-hf-directory"])
+def test_peft_base_without_usable_checkpoint_fails(monkeypatch: pytest.MonkeyPatch, hf_dirs) -> None:
+    import huggingface_hub
+
+    _install_checkpoint_utils(monkeypatch, megatron_dirs=set(), hf_dirs=hf_dirs)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo_id: "/hf/snapshots/abc")
+
+    with pytest.raises(ValueError, match="PEFT requires checkpoint.pretrained_checkpoint"):
+        runner._maybe_load_hf_weights(_peft_cfg(), _peft_container(hf_model_path="org/model"))
+
+
+def test_nano4b_mr_vi_config_is_standalone_lora_at_8k() -> None:
+    from nemo_runspec.config.loader import load_config
+
+    step = step_dir(__file__, "peft", "megatron_bridge")
+    cfg = load_config(step / "config" / "nano4b_mr_vi.yaml")
+    packing = load_config(step.parents[1] / "data_prep" / "sft_packing" / "config" / "nano4b_mr_vi.yaml")
+
+    # The 4B recipe takes no arguments: nothing but the target may reach it.
+    assert dict(cfg.recipe) == {
+        "_target_": "megatron.bridge.recipes.nemotronh.nemotron_3_nano_4b.nemotron_3_nano_4b_peft_config"
+    }
+    assert cfg.hf_model_path == packing.tokenizer.model == "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16"
+    assert cfg.peft.type == "lora"
+    assert (cfg.peft.dim, cfg.peft.alpha) == (16, 32)
+    assert {"linear_qkv", "linear_fc1", "in_proj", "out_proj"} <= set(cfg.peft.target_modules)
+    assert cfg.model.seq_length == cfg.dataset.seq_length == packing.pack_size == 8192
+    assert cfg.dataset.packed_sequence_specs.packed_sequence_size == packing.pack_size
+    # One 8-GPU node with TP=PP=CP=1: the global batch must divide evenly across ranks.
+    assert cfg.train.global_batch_size % 8 == 0
+    assert cfg.scheduler.lr_decay_iters == cfg.train.train_iters
+    assert cfg.hf_load.inherit_save_as_load is False
+    assert cfg.checkpoint.also_save_hf_checkpoint is True
+    assert cfg.run.env.container_image == "nvcr.io/nvidia/nemo:26.08"

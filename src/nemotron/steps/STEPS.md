@@ -30,6 +30,7 @@
 
 | Step | Description | Consumes | Produces |
 | --- | --- | --- | --- |
+| [data_prep/mr_sft_chat](data_prep/mr_sft_chat/) | Turn one language subset of Tiny Aya multilingual reasoning into chat-format JSONL with reasoning: each row gives one example in the subset language and one from its English originals. Drops examples that exceed the training sequence length and writes a packing blend per split for data_prep/sft_packing. | - | training_jsonl |
 | [data_prep/pretrain_prep](data_prep/pretrain_prep/) | Tokenise raw text (HF datasets or local parquet/jsonl) into Megatron bin/idx shards and emit a blend.json that pretrain/megatron_bridge and pretrain/automodel can ingest directly. | filtered_jsonl | binidx |
 | [data_prep/rl_prep](data_prep/rl_prep/) | Resolve HuggingFace dataset references in an RL data blend and shard the output JSONL into the prompt / preference layout expected by rl/nemo_rl/*. | training_jsonl | training_jsonl |
 | [data_prep/sft_packing](data_prep/sft_packing/) | Apply the chat template, tokenize training JSONL, and pack examples into Megatron-Bridge-compatible Parquet shards for SFT. | training_jsonl | packed_parquet |

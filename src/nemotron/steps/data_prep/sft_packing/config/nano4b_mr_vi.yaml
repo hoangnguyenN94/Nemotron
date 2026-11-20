@@ -1,0 +1,53 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Pack the training split of data_prep/mr_sft_chat (Tiny Aya multilingual
+# reasoning, Vietnamese plus English originals) for Nemotron 3 Nano 4B at 8k,
+# the sequence length peft/megatron_bridge -c nano4b_mr_vi trains at.
+#
+# Every shard goes to splits/train: the held-out split is packed separately
+# with -c nano4b_mr_vi_valid, so it never enters the training shards.
+#
+# Required env (env.toml profile or shell): MR_SFT_CHAT_DIR, MR_SFT_PACKED_DIR
+#
+#   nemotron steps run data_prep/sft_packing -c nano4b_mr_vi --batch lepton_mr_sft_prep
+
+defaults: default.yaml
+
+run:
+  env:
+    env_vars:
+      WANDB_NAME: ${oc.env:WANDB_NAME,data-prep-sft-packing-nano4b-mr-vi}
+
+blend_path: ${oc.env:MR_SFT_CHAT_DIR}/blend_train.json
+output_dir: ${oc.env:MR_SFT_PACKED_DIR}/train
+num_shards: 8
+
+tokenizer:
+  model: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+
+pack_size: 8192
+config_name: nano4b-mr-vi
+
+train_ratio: 1.0
+valid_ratio: 0.0
+test_ratio: 0.0
+
+# Sized for a 3-CPU pod (cpu.large): the pipeline keeps one CPU for itself.
+plan:
+  planner_cpus: 0.5
+download:
+  stage_cpus: 0.5
+tokenization:
+  cpus_per_worker: 1

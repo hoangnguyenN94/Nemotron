@@ -1,0 +1,78 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[step]
+id = "data_prep/mr_sft_chat"
+name = "Multilingual Reasoning SFT Chat Data"
+category = "data_prep"
+description = """\
+Turn one language subset of Tiny Aya multilingual reasoning into chat-format \
+JSONL with reasoning: each row gives one example in the subset language and one \
+from its English originals. Drops examples that exceed the training sequence \
+length and writes a packing blend per split for data_prep/sft_packing."""
+tags = ["data_prep", "sft", "peft", "reasoning", "multilingual", "native-reasoning", "jsonl"]
+
+[[produces]]
+type = "training_jsonl"
+description = "train.jsonl and valid.jsonl with messages (assistant turns carry reasoning_content), blend_<split>.json, and stats.json."
+
+[[parameters]]
+name = "dataset"
+description = "HuggingFace dataset with question/thinking/output and original_question/original_thinking/original_output columns."
+default = "CohereLabs/tiny-aya-l2-thinker-multilingual-reasoning"
+
+[[parameters]]
+name = "subset"
+description = "Language subset (dataset config) to use. Only this subset is read."
+default = "vi"
+
+[[parameters]]
+name = "include_english"
+description = "Also emit one example per row from the English original_* columns."
+default = true
+
+[[parameters]]
+name = "splits"
+description = "Mapping of output file name to dataset split."
+
+[[parameters]]
+name = "max_tokens"
+description = "Drop examples whose rendered chat exceeds this many tokens. Keep it just under the downstream pack_size."
+default = 8160
+
+[[parameters]]
+name = "tokenizer"
+description = "Tokenizer used to measure example length; must match data_prep/sft_packing and the trained model."
+default = "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16"
+
+[[parameters]]
+name = "max_rows"
+description = "Optional row cap per split for smoke runs."
+default = "null"
+
+[[strategies]]
+when = "The trainer is sft/megatron_bridge or peft/megatron_bridge"
+then = "Run data_prep/sft_packing on blend_train.json and blend_valid.json separately so the held-out split never enters the training shards."
+
+[[strategies]]
+when = "Changing the training sequence length"
+then = "Rebuild with max_tokens just under the new pack_size, then repack; check stats.json for how many examples were dropped."
+
+[[errors]]
+name = "examples_cut_off_by_packing"
+recovery = "num_truncated_to_pack_size in the packing statistics must be 0. Lower max_tokens and rebuild if it is not."
+
+[reference]
+skill = "src/nemotron/steps/data_prep/mr_sft_chat/README.md"
+dataset = "https://huggingface.co/datasets/CohereLabs/tiny-aya-l2-thinker-multilingual-reasoning"

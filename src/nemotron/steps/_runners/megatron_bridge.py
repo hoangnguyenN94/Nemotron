@@ -108,6 +108,33 @@ def _checkpoint_exists_at(path: Any) -> bool:
     return bool(checkpoint_exists(str(path)))
 
 
+def _hf_base_dir_for_peft(pretrained: Any, hf_path: Any) -> str | None:
+    """Local HF full-model directory Megatron-Bridge can freeze as a PEFT base, or None.
+
+    Megatron-Bridge >= the 2026-07 refactor (nemo:26.08, MB 0c565c9) accepts an HF
+    directory as ``checkpoint.pretrained_checkpoint`` and loads it through AutoBridge
+    in its PEFT hook, so no ``convert/hf_to_megatron`` run is needed. An explicit
+    ``pretrained_checkpoint`` wins; otherwise ``hf_model_path`` is used, resolved to
+    its local snapshot when it is a model id. Older releases lack the helper and get
+    None, which keeps the Megatron-checkpoint requirement.
+    """
+    try:
+        from megatron.bridge.training.utils.checkpoint_utils import is_hf_checkpoint_dir
+    except ImportError:
+        return None
+    source = pretrained or hf_path
+    if not source:
+        return None
+    if is_hf_checkpoint_dir(str(source)):
+        return str(source)
+    if pretrained:
+        return None
+    from huggingface_hub import snapshot_download
+
+    snapshot = snapshot_download(str(hf_path))
+    return snapshot if is_hf_checkpoint_dir(snapshot) else None
+
+
 def _maybe_load_hf_weights(cfg: Any, container: dict[str, Any]) -> None:
     """Pick the model init source by priority: resume > pretrained_checkpoint > HF.
 
@@ -116,8 +143,9 @@ def _maybe_load_hf_weights(cfg: Any, container: dict[str, Any]) -> None:
     itself. Otherwise builds the base from ``hf_model_path``. A missing ``load`` is the
     normal fresh-start case (MB just starts fresh), but an explicitly-set
     ``pretrained_checkpoint`` that has no checkpoint raises rather than silently falling
-    back to HF. PEFT (no HF path) raises if its ``pretrained_checkpoint`` base is
-    missing. Shared by SFT, PEFT, and pretrain/CPT.
+    back to HF. PEFT raises if its base is neither a Megatron checkpoint nor an HF
+    directory this Megatron-Bridge can load (see ``_hf_base_dir_for_peft``).
+    Shared by SFT, PEFT, and pretrain/CPT.
     """
     hf_path = container.get("hf_model_path")
     hf_load = dict(container.get("hf_load") or {})
@@ -140,13 +168,20 @@ def _maybe_load_hf_weights(cfg: Any, container: dict[str, Any]) -> None:
         cfg.checkpoint.load = cfg.checkpoint.save
 
     # PEFT always needs its frozen base from pretrained_checkpoint — even when resuming
-    # an adapter run via `load` — and has no HF fallback. Validate it before launch.
+    # an adapter run via `load`. Validate it before launch.
     if is_peft and not _checkpoint_exists_at(pretrained):
-        raise ValueError(
-            "PEFT requires checkpoint.pretrained_checkpoint to point at an existing Megatron "
-            f"checkpoint (set MEGATRON_PRETRAIN_PATH or pass checkpoint.pretrained_checkpoint=); "
-            f"got {pretrained!r}."
-        )
+        hf_base = _hf_base_dir_for_peft(pretrained, hf_path)
+        if hf_base is None:
+            raise ValueError(
+                "PEFT requires checkpoint.pretrained_checkpoint to point at an existing Megatron "
+                f"checkpoint (set MEGATRON_PRETRAIN_PATH or pass checkpoint.pretrained_checkpoint=); "
+                f"got {pretrained!r}."
+            )
+        # Megatron-Bridge loads the HF directory itself; AutoBridge must not build the
+        # model here, or the base weights would be loaded twice.
+        cfg.checkpoint.pretrained_checkpoint = hf_base
+        cfg.checkpoint.hf_trust_remote_code = bool(container.get("trust_remote_code", False))
+        return
 
     # Skip AutoBridge when a checkpoint is already available to resume from (load/save).
     if any(_checkpoint_exists_at(getattr(cfg.checkpoint, k, None)) for k in ("load", "save")):
