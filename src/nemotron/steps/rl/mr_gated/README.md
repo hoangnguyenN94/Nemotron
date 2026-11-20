@@ -27,6 +27,8 @@ function as the verifier.
 
 - `reward.py` — `gated_reward(raw, row)` used by GRPO callers
 - `schema.py` — gated prompt contract (no gold, hint, or eval IDs)
+- `data.py` — gated training rows: GSM8K in Vietnamese plus a share of English
+- `nemo_rl_plugin.py` — registers the dataset and the reward environment with NeMo-RL
 - `runtime.py` — join traces to prompts, write `rewards.jsonl`
 - `config/tiny.yaml` — three synthetic rollouts, not a quality claim
 
@@ -54,7 +56,22 @@ uv run nemotron steps run rl/mr_gated -c default \
   output_dir=/path/to/output/mr_gated
 ```
 
-Call the reward from GRPO:
+Train with GRPO (Nemotron 3 Nano 4B, one 8-GPU node plus the Ray head):
+
+```bash
+uv run --frozen nemotron steps run rl/nemo_rl/rlvr -c nano4b_mr_gated \
+  --batch lepton_nano4b_mr_gated_sft
+```
+
+`config/nano4b_mr_gated.yaml` under `rl/nemo_rl/rlvr` lists
+`nemotron.steps.rl.mr_gated.nemo_rl_plugin` in `env.plugins`, so every rollout
+is scored by `gated_reward`. Training data is every question of
+`namfam/gsm8k-vietnamese` `train` plus a quarter of their English originals,
+picked evenly across reasoning steps, operations and question length; the
+`val` split is used for validation and the GSM8K test split is never loaded.
+The profile lives in the repo-root `env.toml` (gitignored).
+
+Call the reward directly:
 
 ```python
 from nemotron.steps.rl.mr_gated import gated_reward

@@ -55,6 +55,16 @@ def test_auto_includes_scopes_to_active_recipe_family(tmp_path):
     assert "src/nemotron/kit" in includes
 
 
+def test_auto_includes_ships_extra_branches_of_the_active_collection(tmp_path):
+    _write_fake_repo(tmp_path)
+    script = "src/nemotron/recipes/nano3/stage1_sft/data_prep.py"
+
+    includes = _auto_includes(tmp_path, script_path=script, extra_branches=("super3",))
+
+    assert "src/nemotron/recipes/nano3" in includes
+    assert "src/nemotron/recipes/super3" in includes
+
+
 def test_auto_includes_ships_all_families_without_hint(tmp_path):
     _write_fake_repo(tmp_path)
     includes = _auto_includes(tmp_path, script_path=None)

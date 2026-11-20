@@ -1403,6 +1403,7 @@ def execute_cloud(
         script_path=script_path,
         pod_nemotron_home=nemotron_home,
         repo_root=_get_env(env, "repo_root"),
+        extra_branches=tuple(_to_plain(_get_env(env, "source_branches") or [])),
     )
 
     # ── 3. Executor ──────────────────────────────────────────────────
@@ -1565,6 +1566,7 @@ def execute_cloud_ray(
         script_path=script_path,
         pod_nemotron_home=nemotron_home,
         repo_root=_get_env(env, "repo_root"),
+        extra_branches=tuple(_to_plain(_get_env(env, "source_branches") or [])),
     )
     # Make source importable on every pod (head + workers) without a per-pod
     # install step; Ray actors inherit this via env_vars.

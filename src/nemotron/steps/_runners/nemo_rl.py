@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import os
+import runpy
 import sys
 from pathlib import Path
 
@@ -48,8 +50,35 @@ def exec_or_run_nemo_rl_grpo(
         run_nemo_gym_grpo(config_path=config_path, overrides=overrides)
         return
 
+    plugins = nemo_rl_plugins(config_path, overrides)
+    if plugins:
+        run_nemo_rl_example_with_plugins(
+            upstream_script=upstream_script, config_path=config_path, overrides=overrides, plugins=plugins
+        )
+        return
+
     cmd = [sys.executable, upstream_script, "--config", str(config_path), *overrides]
     os.execvp(cmd[0], cmd)
+
+
+def nemo_rl_plugins(config_path: Path, overrides: list[str] | None = None) -> list[str]:
+    """Return the modules listed under ``env.plugins``."""
+    config = load_nemo_rl_step_config(config_path, overrides or [])
+    return list(OmegaConf.select(config, "env.plugins", default=None) or [])
+
+
+def run_nemo_rl_example_with_plugins(
+    *, upstream_script: str, config_path: Path, overrides: list[str], plugins: list[str]
+) -> None:
+    """Run an upstream example in this process after each plugin's ``register()``.
+
+    Plugins add datasets, processors and environments to NeMo-RL's registries.
+    Those live in the driver process, so the example cannot be exec'd.
+    """
+    for module in plugins:
+        importlib.import_module(module).register()
+    sys.argv = [upstream_script, "--config", str(config_path), *overrides]
+    runpy.run_path(upstream_script, run_name="__main__")
 
 
 def parse_nemo_rl_args(

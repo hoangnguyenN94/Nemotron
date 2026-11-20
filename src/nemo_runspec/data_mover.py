@@ -168,22 +168,28 @@ def _include_collection(
     collection_name: str,
     collection_dir: Path,
     branch: str | None = None,
+    extra_branches: tuple[str, ...] = (),
 ) -> None:
     prefix = f"src/{pkg_name}/{collection_name}"
     for child in sorted(collection_dir.iterdir()):
         if child.name in _EXCLUDE_NAMES:
             continue
-        if branch is None or child.is_file() or child.name == branch or child.name.startswith("_"):
+        wanted = child.name == branch or child.name in extra_branches or child.name.startswith("_")
+        if branch is None or child.is_file() or wanted:
             includes.append(f"{prefix}/{child.name}")
 
 
-def _auto_includes(repo_root: Path, script_path: str | None) -> list[str]:
+def _auto_includes(
+    repo_root: Path, script_path: str | None, extra_branches: tuple[str, ...] = ()
+) -> list[str]:
     """Discover repo-relative paths to ship.
 
     Walks ``<repo>/src/*`` and ships every top-level package. For packages with
     large source collections such as ``recipes/`` or ``steps/``, only the active
     branch from ``script_path`` is included when possible. This keeps the
     tarball small because unrelated runnable collections can weigh many MiB.
+    ``extra_branches`` names further branches of the active collection to ship,
+    for a step that imports code from another branch.
     """
     src = repo_root / "src"
     if not src.is_dir():
@@ -219,6 +225,7 @@ def _auto_includes(repo_root: Path, script_path: str | None) -> list[str]:
                     collection_name=collection_name,
                     collection_dir=collection_dir,
                     branch=script.branch if is_active else None,
+                    extra_branches=extra_branches,
                 )
         else:
             includes.append(f"src/{pkg.name}")
@@ -240,13 +247,14 @@ class SourcePackager(_BasePackager):
     # were serialized while the DGXCloud file-staging path existed. The
     # field is no longer read — DGXCloud now uses env-var chunks like Lepton.
     fixed_output_name: str | None = None
+    extra_branches: tuple[str, ...] = ()
 
     def package(self, path, job_dir, name):  # type: ignore[override]
         out = os.path.join(job_dir, f"{name}.tar.gz")
         if not os.path.exists(out):
             root = Path(self.repo_root)
             with tarfile.open(out, "w:gz") as tf:
-                for rel in _auto_includes(root, self.script_path):
+                for rel in _auto_includes(root, self.script_path, self.extra_branches):
                     tf.add(root / rel, arcname=rel, filter=_tar_filter)
         _warn_if_large_tarball(out)
         return out
@@ -268,6 +276,7 @@ def plan_for(
     script_path: str | None,
     pod_nemotron_home: str,
     repo_root: str | Path | None = None,
+    extra_branches: tuple[str, ...] = (),
 ) -> Plan:
     """Build a :class:`Plan` for ``executor_type``. Mutates ``env_vars``."""
     from nemo_runspec.run import (
@@ -291,7 +300,7 @@ def plan_for(
     patch_dgxcloud_accept_legacy_kwargs()
 
     root = Path(repo_root or Path(__file__).resolve().parents[2])
-    common = {"repo_root": str(root), "script_path": script_path}
+    common = {"repo_root": str(root), "script_path": script_path, "extra_branches": tuple(extra_branches)}
 
     # Both Lepton and DGXCloud deliver env vars via the Job spec's structured
     # field, which bypasses the per-workload Args cap entirely. Use the same
